@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::path::Path;
+use std::io::Write;
 
 /// Iterates through each line in a file, applying the provided callback function
 ///
@@ -157,23 +158,26 @@ fn traverse_nodes(
     callback: &mut impl FnMut(usize, usize),
     get_node_len: &mut impl FnMut(usize) -> usize,
     start_offset: usize,
-    alignment_len: usize,
+    match_len: usize,
+    is_reverse: bool,
 ) -> (String, usize)
 {
-    if steps.len() == 0 || alignment_len == 0 {
+    if steps.is_empty() || match_len == 0 {
         return (String::new(), 0);
     }
 
+    let strand = if is_reverse { "<" } else { ">" };
+
     let mut total_path_length = 0;
     let mut traversed_nodes = Vec::new();
-    let mut remaining_len = alignment_len;
+    let mut remaining_len = match_len;
 
     for (i, step) in steps.iter().enumerate() {
         let (seg, _orient) = step.split_at(step.len() - 1);
         let node_id = seg.parse::<usize>().unwrap();
         let node_length = get_node_len(node_id);
         total_path_length += node_length;
-        traversed_nodes.push(node_id.to_string());
+        traversed_nodes.push(format!("{}{}", strand, node_id));
 
         let coverage = if i == 0 {
             // First node: account for start_offset
@@ -184,14 +188,14 @@ fn traverse_nodes(
         };
 
         remaining_len -= coverage;
-        callback(node_id, node_length);
+        callback(node_id, coverage);
 
-        if remaining_len <= 0 {
+        if remaining_len == 0 {
             break;
         }
     }
 
-    (traversed_nodes.join(","), total_path_length)
+    (traversed_nodes.join(""), total_path_length)
 }
 
 /// Read path positions CSV file and return the data
@@ -257,12 +261,12 @@ fn read_seq_id_starts_map(seq_id_starts_file: &str) -> std::io::Result<HashMap<S
         let line = line?;
         let line = line.trim();
 
-        // println!("Line: {}", line);
+        // eprintln!("Line: {}", line);
 
         if line.is_empty() {
             continue;
         }
-        // println!("Line bytes: {:?}", line.as_bytes());
+        // eprintln!("Line bytes: {:?}", line.as_bytes());
 
         let fields: Vec<&str> = line.split(' ').collect();
         if fields.len() >= 2 {
@@ -294,7 +298,7 @@ fn read_seq_id_starts_map(seq_id_starts_file: &str) -> std::io::Result<HashMap<S
             0
         };
 
-        println!("Storing: seq_id: {}, val: {}, {}", seq_id, cumulative_start, count);
+        eprintln!("Storing: seq_id: {}, val: {}, {}", seq_id, cumulative_start, count);
 
         seq_map.insert(seq_id.clone(), (*cumulative_start, count));
     }
@@ -335,13 +339,141 @@ fn read_cumulative_starts(filename: &str) -> std::io::Result<Vec<usize>> {
         }
     });
 
-    eprintln!("Cumulative starts vector:");
-    for (index, value) in cumulative_starts.iter().enumerate() {
-        eprintln!("  [{}]: {}", index, value);
-    }
-    eprintln!("Total entries: {}", cumulative_starts.len());
+    // eprintln!("Cumulative starts vector:");
+    // for (index, value) in cumulative_starts.iter().enumerate() {
+    //     eprintln!("  [{}]: {}", index, value);
+    // }
+    eprintln!("Size of cumulative starts: {}; Total no. of entries: {}", cumulative_starts.len(), cumulative_starts[cumulative_starts.len() - 1]);
 
     Ok(cumulative_starts)
+}
+
+fn process_path_matches(
+    steps: &[&str],
+    seq_id: usize,
+    name: &str,
+    is_reverse: bool,
+    path_starts: &Vec<usize>,
+    path_pos_path: &Path,
+    gaf_output: &mut Option<std::fs::File>,
+    callback: &mut impl FnMut(usize, usize),
+    get_node_len: &mut impl FnMut(usize) -> usize,
+) -> std::io::Result<usize> {
+
+    let st = path_starts[seq_id];
+    let end = path_starts[seq_id + 1];
+    let num_matches = end - st;
+
+    if num_matches == 0 {
+        return Ok(0);
+    }
+
+    eprintln!("--------");
+    eprintln!("Processing path: {}   seq_id: {}   st: {}   num_matches: {}", name, seq_id, st, num_matches);
+
+    let mut processed_matches = 0;
+    let mut total_gaf_entries = 0;
+
+    let mut path_pos_reader = create_reader(path_pos_path)?;
+    let mut pos_line = String::new();
+    let mut buffer = Vec::new();
+
+    // Skip lines without string allocation
+    for _ in 0..st {
+        buffer.clear();
+        path_pos_reader.read_until(b'\n', &mut buffer)?;
+    }
+
+    let bytes_read = path_pos_reader.read_line(&mut pos_line)?;
+    if bytes_read == 0 {
+        eprintln!("Warning: No match data found for path at position {}", st);
+        return Ok(0);
+    }
+    let pos_line_str = pos_line.trim();
+    let fields: Vec<&str> = pos_line_str.split('\t').collect();
+
+    if fields.len() < 6 {
+        eprintln!("Warning: Insufficient fields in path_pos line\n");
+        return Ok(0);
+    }
+    let (mut curr_node_id, mut curr_offset, mut match_len, mut read_start, mut read_id) = (
+        fields[0].parse::<usize>().unwrap(),
+        fields[1].parse::<usize>().unwrap(),
+        fields[3].parse::<usize>().unwrap(),
+        fields[4].parse::<usize>().unwrap(),
+        fields[5].parse::<usize>().unwrap(),
+    );
+
+    eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, match_len, read_id, read_start);
+
+    let mut i = 0;
+    loop {
+        // eprintln!("Path: {} Loop: {} processed_matches: {} total_matches: {}", name, i, processed_matches, num_matches);
+        for (i, step) in steps.iter().enumerate() {
+            let (seg, _orient) = step.split_at(step.len() - 1);
+            let seg_id = seg.parse::<usize>().unwrap();
+
+            // // continue walking down the path
+            // if seg_id != curr_node_id {
+            //     continue;
+            // }
+
+            while seg_id == curr_node_id {
+                processed_matches += 1;
+                let remaining_steps = &steps[i..];
+
+                // todo: handle reverse strand traversal
+                // Start traversing starting from the current node
+                let (path_str, path_len) = traverse_nodes(&remaining_steps, callback, get_node_len, curr_offset, match_len, is_reverse);
+                let path_start = curr_offset;
+                let path_end = curr_offset + match_len;
+                if path_len < match_len {
+                    eprintln!("ERROR Path len {} << match_len {}. Path name: {}, Path str: {}", path_len, match_len, name, path_str);
+                    break;
+                }
+                if path_len < path_end {
+                    eprintln!("ERROR: Path len {} <= path_end {}. Path name: {}, Path str: {}", path_len, path_end, name, path_str);
+                    break;
+                }
+
+                total_gaf_entries += 1;
+                let gaf_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", read_id, read_start, path_str, path_len, path_start, path_end, match_len, name);
+
+                if let Some(ref mut file) = gaf_output {
+                    writeln!(file, "{}", gaf_line)?;
+                } else {
+                    eprintln!("\nAlignment: read_id, read_st, path_str, path_len, path_st, path_end, match_len, path_name");
+                    eprintln!("{}", gaf_line);
+                }
+
+                if processed_matches == num_matches {
+                    eprintln!("Processed all {} matches for path: {}\n", num_matches, name);
+                    return Ok(total_gaf_entries);
+                }
+
+                // load a new match
+                pos_line.clear();
+                let bytes_read = path_pos_reader.read_line(&mut pos_line)?;
+                if bytes_read == 0 {
+                    eprintln!("Warning: Unexpected end of file while reading match data");
+                    return Ok(total_gaf_entries);
+                }
+                let pos_line_str = pos_line.trim();
+                let fields: Vec<&str> = pos_line_str.split('\t').collect();
+                (curr_node_id, curr_offset, match_len, read_start, read_id) = (
+                    fields[0].parse::<usize>().unwrap(),
+                    fields[1].parse::<usize>().unwrap(),
+                    fields[3].parse::<usize>().unwrap(),
+                    fields[4].parse::<usize>().unwrap(),
+                    fields[5].parse::<usize>().unwrap(),
+                );
+                // eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}, seg_id: {}, i: {}, len: {}", curr_node_id, curr_offset, match_len, read_id, read_start, seg_id, i, steps.len());
+            }
+        }
+        i += 1;
+    }
+
+    Ok(total_gaf_entries)
 }
 
 fn walk_gfa(
@@ -349,17 +481,21 @@ fn walk_gfa(
     path_pos_file: &str,
     path_to_seq_id_map: HashMap<String, usize>,
     path_starts: Vec<usize>,
+    mut gaf_output: Option<std::fs::File>,
     mut callback: impl FnMut(usize, usize),
     mut get_node_len: impl FnMut(usize) -> usize) -> std::io::Result<()>
 {
+    if let Some(ref mut file) = gaf_output {
+        let header_line = "read_id\tread_st\tpath_str\tpath_len\tpath_st\tpath_end\tmatch_len\tpath_name";
+        writeln!(file, "{}", header_line)?;
+    }
     let path = Path::new(gfa_path);
     let mut reader = create_reader(path)?;
 
     let path_pos_path = Path::new(path_pos_file);
 
     let mut line = String::new();
-
-    // dbg!();
+    let mut total_gaf_entries = 0;
 
     loop {
         line.clear();
@@ -374,119 +510,64 @@ fn walk_gfa(
         if !line_str.starts_with('P') {
             continue;
         }
-        // println!("{}", line_str);
 
         // Parse segment line format: P<tab>p_name<tab>steps
         let mut fields = line_str.split('\t');
-        
+
         let Some((name, steps)) = fields.next().and_then(|_type| {
             let name = fields.next()?;
             let steps = fields.next()?;
             Some((name, steps))
         }) else {
-            println!("Unable to parse GFA path: {}\n", line_str);
+            eprintln!("Unable to parse GFA path: {}\n", line_str);
             continue;
         };
 
         // check if path name in map
         if !path_to_seq_id_map.contains_key(name) {
-            println!("Skipping path: {} not found\n", name);
+            eprintln!("Skipping path: {} not found\n", name);
             continue;
         }
 
-        let seq_id = path_to_seq_id_map[name] * 2;  // Paths are represented by positive strands
-        let st = path_starts[seq_id];
-        let end = path_starts[seq_id + 1];
-        let num_matches = end - st;
-
-        if num_matches <= 0 {
-            println!("No entry for path: {}, seq_id: {}, st:{}\n", name, seq_id, st);
-            continue;
-        }
-
+        let positive_strand_seq_id = path_to_seq_id_map[name] * 2;  // Paths are represented by positive strands
         let steps: Vec<&str> = steps.split(',').collect();
 
-        println!("Processing path: {}   seq_id: {}   st: {}   length: {}", name, seq_id, st, num_matches);
-
-
-        let mut processed_matches = 0;
-
-        let mut path_pos_reader = create_reader(path_pos_path)?;
-        let mut pos_line = String::new();
-        let mut buffer = Vec::new();
-
-        // Skip lines without string allocation
-        for _ in 0..st {
-            buffer.clear();
-            path_pos_reader.read_until(b'\n', &mut buffer)?;
+        match process_path_matches(
+            &steps,
+            positive_strand_seq_id,
+            name,
+            false,
+            &path_starts,
+            &path_pos_path,
+            &mut gaf_output,
+            &mut callback,
+            &mut get_node_len,
+        ) {
+            Ok(entries) => total_gaf_entries += entries,
+            Err(e) => eprintln!("Error processing path {}: {}", name, e),
         }
 
-        path_pos_reader.read_line(& mut pos_line)?;     // todo: handle empty line?
-        let pos_line_str = pos_line.trim();
-        let mut fields :Vec<&str> = pos_line_str.split('\t').collect();
+        let reverse_strand_seq_id = positive_strand_seq_id + 1;  // Paths are represented by positive strands
 
-        if fields.len() < 6 {
-            eprintln!("Warning: Insufficient fields in path_pos line\n");
-            continue;
+        let reverse_steps: Vec<&str> = steps.iter().rev().copied().collect();
+        match process_path_matches(
+            &reverse_steps,
+            reverse_strand_seq_id,
+            &format!("{}_reverse", name),
+            true,
+            &path_starts,
+            &path_pos_path,
+            &mut gaf_output,
+            &mut callback,
+            &mut get_node_len,
+        ) {
+            Ok(entries) => total_gaf_entries += entries,
+            Err(e) => eprintln!("Error processing path {}: {}", name, e),
         }
-        let (mut curr_node_id, mut curr_offset, mut alignment_len, mut read_start, mut read_id) = (
-            fields[0].parse::<usize>().unwrap(),
-            fields[1].parse::<usize>().unwrap(),
-            fields[3].parse::<usize>().unwrap(),
-            fields[4].parse::<usize>().unwrap(),
-            fields[5].parse::<usize>().unwrap(),
-        );
 
-        println!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, alignment_len, read_id, read_start);
-
-        for (i, step) in steps.iter().enumerate() {
-            let (seg, orient) = step.split_at(step.len() - 1);
-            let seg_id = seg.parse::<usize>().unwrap();
-            
-            // continue walking down the path
-            if seg_id != curr_node_id {
-                continue;
-            }
-
-            processed_matches += 1;
-            let remaining_steps = &steps[i..];
-
-            // todo: handle reverse strand traversal
-            // Start traversing starting from the current node
-            let (path_str, path_len) = traverse_nodes(&remaining_steps, &mut callback, &mut get_node_len, curr_offset, alignment_len);
-            let path_start = curr_offset;
-            let path_end = curr_offset + alignment_len;
-            if path_len < alignment_len {
-                eprintln!("ERROR Path len {} << alignment_len {}. Path name: {}, Path str: {}", path_len, alignment_len, name, path_str);
-                break;
-            }
-            if path_len < path_end {
-                eprintln!("ERROR: Path len {} <= path_end {}. Path name: {}, Path str: {}", path_len, path_end, name, path_str);
-                break;
-            }
-
-            println!("\nAlignment: read_id, read_st, path_str, path_len, path_st, path_end, alignment_len, path_name");
-            println!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", read_id, read_start, path_str, path_len, path_start, path_end, alignment_len, name);
-            if processed_matches == num_matches {
-                break;
-            }
-
-            // load a new match
-            pos_line.clear();
-            path_pos_reader.read_line(& mut pos_line)?;     // todo: handle empty line?
-            let pos_line_str = pos_line.trim();
-            let mut fields :Vec<&str> = pos_line_str.split('\t').collect();
-            (curr_node_id, curr_offset, alignment_len, read_start, read_id) = (
-                fields[0].parse::<usize>().unwrap(),
-                fields[1].parse::<usize>().unwrap(),
-                fields[3].parse::<usize>().unwrap(),
-                fields[4].parse::<usize>().unwrap(),
-                fields[5].parse::<usize>().unwrap(),
-            );
-            println!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, alignment_len, read_id, read_start);
-        }
-        println!("---------------------");
     }
+    eprintln!("---------------------");
+    eprintln!("Total GAF entries: {}", total_gaf_entries);
     Ok(())
 }
 
@@ -559,6 +640,9 @@ struct Args {
     /// Path names
     #[arg(long)]
     path_names: Option<String>,
+    /// File prefix for output GAF file
+    #[arg(long)]
+    gaf_file_prefix: Option<String>,
 }
 
 fn main() {
@@ -568,10 +652,10 @@ fn main() {
     // Check if we're in CSV processing mode
     if let (Some(path_pos_file), Some(seq_id_starts_file)) = (&args.path_pos, &args.seq_id_starts) {
         // let path_pos_data = read_path_pos_csv(path_pos_file).unwrap();
-        println!("Processing gfa file: {}", gfa_file);
-        println!("Args: {}, {}", path_pos_file, seq_id_starts_file);
+        eprintln!("Processing gfa file: {}", gfa_file);
+        eprintln!("Args: {}, {}", path_pos_file, seq_id_starts_file);
         let path_names_file_name = &args.path_names.unwrap();
-        println!("Path names file: {}", path_names_file_name);
+        eprintln!("Path names file: {}", path_names_file_name);
         // let seq_id_starts_map = read_seq_id_starts_map(seq_id_starts_file).unwrap();
 
         let seq_starts = read_cumulative_starts(seq_id_starts_file).unwrap();
@@ -583,29 +667,63 @@ fn main() {
 
         let mut coverage: Vec<f64> = vec![0.0; num_segments];
 
-        if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, |node_id, len| {
+        // Create output file if file_prefix is provided
+        let gaf_output = if let Some(prefix) = &args.gaf_file_prefix {
+            let gaf_filename = format!("{}.gaf", prefix);
+            Some(std::fs::File::create(gaf_filename).expect("Could not create GAF output file"))
+        } else {
+            None
+        };
+
+        if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
             coverage[node_id - min_id] += len as f64;
         }, |node_id| segment_lengths[node_id - min_id]) {
             eprintln!("Error processing GFA file with path positions: {}", e);
             std::process::exit(1);
         }
-        print!("#sample");
-        for n in min_id..min_id + num_segments {
-            print!("\tnode.{}", n);
-        }
-        println!();
+
+        let output_filename = format!("{}_coverage.csv",
+                                      args.gaf_file_prefix.as_deref().unwrap_or("output"));
+        let mut output_file = std::fs::File::create(&output_filename)
+            .expect("Could not create coverage output file");
+
+        // Write header
+        writeln!(output_file, "node_id,node_coverage").unwrap();
+
+        // Write coverage data
         for (i, v) in coverage.into_iter().enumerate() {
-            print!(
-                "\t{}",
-                if args.len_scale {
-                    v / segment_lengths[i] as f64
-                } else {
-                    v
-                }
-            );
+            let node_id = min_id + i;
+            let coverage_value = if args.len_scale {
+                v / segment_lengths[i] as f64
+            } else {
+                v
+            };
+            writeln!(output_file, "{},{:.2}", node_id, coverage_value).unwrap();
         }
-        println!();
+
+        eprintln!("Coverage data written to: {}", output_filename);
         return;
+        
+        
+        
+        // return;
+        // eprint!("#sample");
+        // for n in min_id..min_id + num_segments {
+        //     eprint!("\tnode.{}", n);
+        // }
+        // eprintln!();
+        // for (i, v) in coverage.into_iter().enumerate() {
+        //     print!(
+        //         "\t{}",
+        //         if args.len_scale {
+        //             v / segment_lengths[i] as f64
+        //         } else {
+        //             v
+        //         }
+        //     );
+        // }
+        // eprintln!();
+        // return;
     }
 
     // Original coverage calculation logic
@@ -659,7 +777,7 @@ fn main() {
         println!("##sample: {}", gaf_file);
         println!("#coverage");
         for (i, v) in coverage.into_iter().enumerate() {
-            println!(
+            eprintln!(
                 "{}",
                 if args.len_scale {
                     v / segment_lengths[i] as f64
@@ -673,7 +791,7 @@ fn main() {
         for n in min_id..min_id + num_segments {
             print!("\tnode.{}", n);
         }
-        println!();
+        eprintln!();
         print!("{}", gaf_file);
         for (i, v) in coverage.into_iter().enumerate() {
             print!(
@@ -685,6 +803,6 @@ fn main() {
                 }
             );
         }
-        println!();
+        eprintln!();
     }
 }
