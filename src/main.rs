@@ -166,17 +166,26 @@ fn traverse_nodes(
         return (String::new(), 0);
     }
 
-    let strand = if is_reverse { "<" } else { ">" };
-
     let mut total_path_length = 0;
     let mut traversed_nodes = Vec::new();
     let mut remaining_len = match_len;
 
     for (i, step) in steps.iter().enumerate() {
-        let (seg, _orient) = step.split_at(step.len() - 1);
+        let (seg, orient) = step.split_at(step.len() - 1);
         let node_id = seg.parse::<usize>().unwrap();
         let node_length = get_node_len(node_id);
         total_path_length += node_length;
+        
+        // GAF strand is the XOR of the node's GFA orientation (+/-) and the
+        // path walk direction. Using `is_reverse` alone is wrong: a '-' node on
+        // a forward walk must emit '<', and vice versa.
+        let strand = match (orient, is_reverse) {
+            ("+", false) => ">",
+            ("-", false) => "<",
+            ("+", true) => "<",
+            ("-", true) => ">",
+            _ => ">", // default to forward
+        };
         traversed_nodes.push(format!("{}{}", strand, node_id));
 
         let coverage = if i == 0 {
@@ -437,13 +446,10 @@ fn process_path_matches(
                 }
 
                 total_gaf_entries += 1;
-                let gaf_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", read_id, read_start, path_str, path_len, path_start, path_end, match_len, name);
-
+                
                 if let Some(ref mut file) = gaf_output {
+                    let gaf_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", read_id, read_start, path_str, path_len, path_start, path_end, match_len, name);
                     writeln!(file, "{}", gaf_line)?;
-                } else {
-                    eprintln!("\nAlignment: read_id, read_st, path_str, path_len, path_st, path_end, match_len, path_name");
-                    eprintln!("{}", gaf_line);
                 }
 
                 if processed_matches == num_matches {
@@ -643,6 +649,9 @@ struct Args {
     /// File prefix for output GAF file
     #[arg(long)]
     gaf_file_prefix: Option<String>,
+    /// File prefix for coverage output (used when not generating GAF)
+    #[arg(long)]
+    coverage_prefix: Option<String>,
 }
 
 fn main() {
@@ -683,7 +692,9 @@ fn main() {
         }
 
         let output_filename = format!("{}_coverage.csv",
-                                      args.gaf_file_prefix.as_deref().unwrap_or("output"));
+                                      args.gaf_file_prefix.as_deref()
+                                          .or(args.coverage_prefix.as_deref())
+                                          .unwrap_or("output"));
         let mut output_file = std::fs::File::create(&output_filename)
             .expect("Could not create coverage output file");
 
