@@ -6,6 +6,19 @@ use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::path::Path;
 use std::io::Write;
+use bytemuck::{Pod, Zeroable};
+
+/// On-disk record in `_path_pos.bin` (written by find_mems). Little-endian, 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Record {
+    node_id: u32,
+    offset_rev: u32, // bit 31 = is_rev, bits 0..30 = node-local offset
+    match_len: u32,
+    read_st: u32,
+    read_id: u32,
+    _pad: u32,
+}
 
 /// Iterates through each line in a file, applying the provided callback function
 ///
@@ -362,8 +375,8 @@ fn process_path_matches(
     seq_id: usize,
     name: &str,
     is_reverse: bool,
-    path_starts: &Vec<usize>,
-    path_pos_path: &Path,
+    path_starts: &[usize],
+    records: &[Record],
     gaf_output: &mut Option<std::fs::File>,
     callback: &mut impl FnMut(usize, usize),
     get_node_len: &mut impl FnMut(usize) -> usize,
@@ -383,57 +396,33 @@ fn process_path_matches(
     let mut processed_matches = 0;
     let mut total_gaf_entries = 0;
 
-    let mut path_pos_reader = create_reader(path_pos_path)?;
-    let mut pos_line = String::new();
-    let mut buffer = Vec::new();
+    let load = |idx: usize| -> (usize, usize, usize, usize, usize) {
+        let r = &records[idx];
+        (
+            r.node_id as usize,
+            (r.offset_rev & 0x7FFF_FFFF) as usize,
+            r.match_len as usize,
+            r.read_st as usize,
+            r.read_id as usize,
+        )
+    };
 
-    // Skip lines without string allocation
-    for _ in 0..st {
-        buffer.clear();
-        path_pos_reader.read_until(b'\n', &mut buffer)?;
-    }
-
-    let bytes_read = path_pos_reader.read_line(&mut pos_line)?;
-    if bytes_read == 0 {
-        eprintln!("Warning: No match data found for path at position {}", st);
-        return Ok(0);
-    }
-    let pos_line_str = pos_line.trim();
-    let fields: Vec<&str> = pos_line_str.split('\t').collect();
-
-    if fields.len() < 6 {
-        eprintln!("Warning: Insufficient fields in path_pos line\n");
-        return Ok(0);
-    }
-    let (mut curr_node_id, mut curr_offset, mut match_len, mut read_start, mut read_id) = (
-        fields[0].parse::<usize>().unwrap(),
-        fields[1].parse::<usize>().unwrap(),
-        fields[3].parse::<usize>().unwrap(),
-        fields[4].parse::<usize>().unwrap(),
-        fields[5].parse::<usize>().unwrap(),
-    );
+    let mut idx = st;
+    let (mut curr_node_id, mut curr_offset, mut match_len, mut read_start, mut read_id) = load(idx);
 
     eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, match_len, read_id, read_start);
 
-    let mut i = 0;
     loop {
-        // eprintln!("Path: {} Loop: {} processed_matches: {} total_matches: {}", name, i, processed_matches, num_matches);
         for (i, step) in steps.iter().enumerate() {
             let (seg, _orient) = step.split_at(step.len() - 1);
             let seg_id = seg.parse::<usize>().unwrap();
-
-            // // continue walking down the path
-            // if seg_id != curr_node_id {
-            //     continue;
-            // }
 
             while seg_id == curr_node_id {
                 processed_matches += 1;
                 let remaining_steps = &steps[i..];
 
                 // todo: handle reverse strand traversal
-                // Start traversing starting from the current node
-                let (path_str, path_len) = traverse_nodes(&remaining_steps, callback, get_node_len, curr_offset, match_len, is_reverse);
+                let (path_str, path_len) = traverse_nodes(remaining_steps, callback, get_node_len, curr_offset, match_len, is_reverse);
                 let path_start = curr_offset;
                 let path_end = curr_offset + match_len;
                 if path_len < match_len {
@@ -446,7 +435,7 @@ fn process_path_matches(
                 }
 
                 total_gaf_entries += 1;
-                
+
                 if let Some(ref mut file) = gaf_output {
                     let gaf_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", read_id, read_start, path_str, path_len, path_start, path_end, match_len, name);
                     writeln!(file, "{}", gaf_line)?;
@@ -457,29 +446,11 @@ fn process_path_matches(
                     return Ok(total_gaf_entries);
                 }
 
-                // load a new match
-                pos_line.clear();
-                let bytes_read = path_pos_reader.read_line(&mut pos_line)?;
-                if bytes_read == 0 {
-                    eprintln!("Warning: Unexpected end of file while reading match data");
-                    return Ok(total_gaf_entries);
-                }
-                let pos_line_str = pos_line.trim();
-                let fields: Vec<&str> = pos_line_str.split('\t').collect();
-                (curr_node_id, curr_offset, match_len, read_start, read_id) = (
-                    fields[0].parse::<usize>().unwrap(),
-                    fields[1].parse::<usize>().unwrap(),
-                    fields[3].parse::<usize>().unwrap(),
-                    fields[4].parse::<usize>().unwrap(),
-                    fields[5].parse::<usize>().unwrap(),
-                );
-                // eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}, seg_id: {}, i: {}, len: {}", curr_node_id, curr_offset, match_len, read_id, read_start, seg_id, i, steps.len());
+                idx += 1;
+                (curr_node_id, curr_offset, match_len, read_start, read_id) = load(idx);
             }
         }
-        i += 1;
     }
-
-    Ok(total_gaf_entries)
 }
 
 fn walk_gfa(
@@ -498,7 +469,9 @@ fn walk_gfa(
     let path = Path::new(gfa_path);
     let mut reader = create_reader(path)?;
 
-    let path_pos_path = Path::new(path_pos_file);
+    let bytes = std::fs::read(path_pos_file)?;
+    let records: &[Record] = bytemuck::cast_slice(&bytes);
+    eprintln!("Loaded {} path_pos records ({} bytes)", records.len(), bytes.len());
 
     let mut line = String::new();
     let mut total_gaf_entries = 0;
@@ -544,7 +517,7 @@ fn walk_gfa(
             name,
             false,
             &path_starts,
-            &path_pos_path,
+            records,
             &mut gaf_output,
             &mut callback,
             &mut get_node_len,
@@ -562,7 +535,7 @@ fn walk_gfa(
             &format!("{}_reverse", name),
             true,
             &path_starts,
-            &path_pos_path,
+            records,
             &mut gaf_output,
             &mut callback,
             &mut get_node_len,
