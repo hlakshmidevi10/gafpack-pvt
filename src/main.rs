@@ -397,72 +397,71 @@ fn process_path_matches(
         eprintln!("Processing path: {}   seq_id: {}   st: {}   num_matches: {}", name, seq_id, st, num_matches);
     }
 
-    let mut processed_matches = 0;
-    let mut total_gaf_entries = 0;
-
-    let load = |idx: usize| -> (usize, usize, usize, usize, usize) {
-        let r = &records[idx];
-        (
-            r.node_id as usize,
-            (r.offset_rev & 0x7FFF_FFFF) as usize,
-            r.match_len as usize,
-            r.read_st as usize,
-            r.read_id as usize,
-        )
-    };
-
-    let mut idx = st;
-    let (mut curr_node_id, mut curr_offset, mut match_len, mut read_start, mut read_id) = load(idx);
-
-    if verbose {
-        eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, match_len, read_id, read_start);
+    // Map node_id -> all step indices (ascending). The old multi-pass scan
+    // matched a record at the first occurrence >= its current for-loop cursor
+    // (wrapping to occurrence 0 on pass restart), and only advanced the cursor
+    // when node_id changed. Replicating that here keeps output byte-identical
+    // while turning O(passes * steps) (mean ~229 passes) into O(steps + records).
+    let mut step_index: HashMap<usize, Vec<usize>> = HashMap::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let (seg, _orient) = step.split_at(step.len() - 1);
+        let seg_id = seg.parse::<usize>().unwrap();
+        step_index.entry(seg_id).or_default().push(i);
     }
 
+    let mut total_gaf_entries = 0;
     let mut path_str = String::with_capacity(64);
-    let mut passes: u64 = 0;
-    loop {
-        passes += 1;
-        for (i, step) in steps.iter().enumerate() {
-            let (seg, _orient) = step.split_at(step.len() - 1);
-            let seg_id = seg.parse::<usize>().unwrap();
+    let mut cursor: usize = 0;
+    let mut prev_node_id: usize = usize::MAX;
+    let mut i: usize = 0;
 
-            while seg_id == curr_node_id {
-                processed_matches += 1;
-                let remaining_steps = &steps[i..];
+    for idx in st..end {
+        let r = &records[idx];
+        let curr_node_id = r.node_id as usize;
+        let curr_offset = (r.offset_rev & 0x7FFF_FFFF) as usize;
+        let match_len = r.match_len as usize;
+        let read_start = r.read_st as usize;
+        let read_id = r.read_id as usize;
 
-                // todo: handle reverse strand traversal
-                path_str.clear();
-                let path_len = traverse_nodes(remaining_steps, callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
-                let path_start = curr_offset;
-                let path_end = curr_offset + match_len;
-                if path_len < match_len {
-                    eprintln!("ERROR Path len {} << match_len {}. Path name: {}, Path str: {}", path_len, match_len, name, path_str);
-                    break;
-                }
-                if path_len < path_end {
-                    eprintln!("ERROR: Path len {} <= path_end {}. Path name: {}, Path str: {}", path_len, path_end, name, path_str);
-                    break;
-                }
+        if curr_node_id != prev_node_id {
+            let Some(occs) = step_index.get(&curr_node_id) else {
+                eprintln!("ERROR: node_id {} not on path {} (seq_id {}); skipping record idx {}",
+                          curr_node_id, name, seq_id, idx);
+                prev_node_id = usize::MAX;
+                continue;
+            };
+            let p = occs.partition_point(|&j| j < cursor);
+            i = if p < occs.len() { occs[p] } else { occs[0] };
+            cursor = i + 1;
+            prev_node_id = curr_node_id;
+        }
 
-                total_gaf_entries += 1;
+        // todo: handle reverse strand traversal
+        path_str.clear();
+        let path_len = traverse_nodes(&steps[i..], callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
+        let path_start = curr_offset;
+        let path_end = curr_offset + match_len;
+        if path_len < match_len {
+            eprintln!("ERROR Path len {} << match_len {}. Path name: {}, Path str: {}", path_len, match_len, name, path_str);
+            continue;
+        }
+        if path_len < path_end {
+            eprintln!("ERROR: Path len {} <= path_end {}. Path name: {}, Path str: {}", path_len, path_end, name, path_str);
+            continue;
+        }
 
-                if let Some(ref mut file) = gaf_output {
-                    write!(file, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                           read_id, read_start, path_str, path_len, path_start, path_end, match_len, name)?;
-                }
+        total_gaf_entries += 1;
 
-                if processed_matches == num_matches {
-                    if verbose {
-                        eprintln!("Processed all {} matches for path: {} in {} pass(es)\n", num_matches, name, passes);
-                    }
-                    return Ok((total_gaf_entries, passes));
-                }
-
-                idx += 1;
-                (curr_node_id, curr_offset, match_len, read_start, read_id) = load(idx);
-            }
+        if let Some(ref mut file) = gaf_output {
+            write!(file, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                   read_id, read_start, path_str, path_len, path_start, path_end, match_len, name)?;
         }
     }
+
+    if verbose {
+        eprintln!("Processed all {} matches for path: {}\n", num_matches, name);
+    }
+    Ok((total_gaf_entries, 1))
 }
 
 fn walk_gfa(
