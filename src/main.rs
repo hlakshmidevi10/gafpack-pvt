@@ -3,7 +3,7 @@ use clap::Parser;
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{prelude::*, BufReader};
+use std::io::{prelude::*, BufReader, BufWriter};
 use std::path::Path;
 use std::io::Write;
 use bytemuck::{Pod, Zeroable};
@@ -173,14 +173,14 @@ fn traverse_nodes(
     start_offset: usize,
     match_len: usize,
     is_reverse: bool,
-) -> (String, usize)
+    path_str: &mut String,
+) -> usize
 {
     if steps.is_empty() || match_len == 0 {
-        return (String::new(), 0);
+        return 0;
     }
 
     let mut total_path_length = 0;
-    let mut traversed_nodes = Vec::new();
     let mut remaining_len = match_len;
 
     for (i, step) in steps.iter().enumerate() {
@@ -188,18 +188,19 @@ fn traverse_nodes(
         let node_id = seg.parse::<usize>().unwrap();
         let node_length = get_node_len(node_id);
         total_path_length += node_length;
-        
+
         // GAF strand is the XOR of the node's GFA orientation (+/-) and the
         // path walk direction. Using `is_reverse` alone is wrong: a '-' node on
         // a forward walk must emit '<', and vice versa.
         let strand = match (orient, is_reverse) {
-            ("+", false) => ">",
-            ("-", false) => "<",
-            ("+", true) => "<",
-            ("-", true) => ">",
-            _ => ">", // default to forward
+            ("+", false) => '>',
+            ("-", false) => '<',
+            ("+", true) => '<',
+            ("-", true) => '>',
+            _ => '>', // default to forward
         };
-        traversed_nodes.push(format!("{}{}", strand, node_id));
+        path_str.push(strand);
+        path_str.push_str(seg);
 
         let coverage = if i == 0 {
             // First node: account for start_offset
@@ -217,7 +218,7 @@ fn traverse_nodes(
         }
     }
 
-    (traversed_nodes.join(""), total_path_length)
+    total_path_length
 }
 
 /// Read path positions CSV file and return the data
@@ -377,21 +378,24 @@ fn process_path_matches(
     is_reverse: bool,
     path_starts: &[usize],
     records: &[Record],
-    gaf_output: &mut Option<std::fs::File>,
+    gaf_output: &mut Option<BufWriter<File>>,
     callback: &mut impl FnMut(usize, usize),
     get_node_len: &mut impl FnMut(usize) -> usize,
-) -> std::io::Result<usize> {
+    verbose: bool,
+) -> std::io::Result<(usize, u64)> {
 
     let st = path_starts[seq_id];
     let end = path_starts[seq_id + 1];
     let num_matches = end - st;
 
     if num_matches == 0 {
-        return Ok(0);
+        return Ok((0, 0));
     }
 
-    eprintln!("--------");
-    eprintln!("Processing path: {}   seq_id: {}   st: {}   num_matches: {}", name, seq_id, st, num_matches);
+    if verbose {
+        eprintln!("--------");
+        eprintln!("Processing path: {}   seq_id: {}   st: {}   num_matches: {}", name, seq_id, st, num_matches);
+    }
 
     let mut processed_matches = 0;
     let mut total_gaf_entries = 0;
@@ -410,9 +414,14 @@ fn process_path_matches(
     let mut idx = st;
     let (mut curr_node_id, mut curr_offset, mut match_len, mut read_start, mut read_id) = load(idx);
 
-    eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, match_len, read_id, read_start);
+    if verbose {
+        eprintln!("Processing node: {} offset: {}, al_len: {}, read_id: {}, read_st: {}", curr_node_id, curr_offset, match_len, read_id, read_start);
+    }
 
+    let mut path_str = String::with_capacity(64);
+    let mut passes: u64 = 0;
     loop {
+        passes += 1;
         for (i, step) in steps.iter().enumerate() {
             let (seg, _orient) = step.split_at(step.len() - 1);
             let seg_id = seg.parse::<usize>().unwrap();
@@ -422,7 +431,8 @@ fn process_path_matches(
                 let remaining_steps = &steps[i..];
 
                 // todo: handle reverse strand traversal
-                let (path_str, path_len) = traverse_nodes(remaining_steps, callback, get_node_len, curr_offset, match_len, is_reverse);
+                path_str.clear();
+                let path_len = traverse_nodes(remaining_steps, callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
                 let path_start = curr_offset;
                 let path_end = curr_offset + match_len;
                 if path_len < match_len {
@@ -437,13 +447,15 @@ fn process_path_matches(
                 total_gaf_entries += 1;
 
                 if let Some(ref mut file) = gaf_output {
-                    let gaf_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", read_id, read_start, path_str, path_len, path_start, path_end, match_len, name);
-                    writeln!(file, "{}", gaf_line)?;
+                    write!(file, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                           read_id, read_start, path_str, path_len, path_start, path_end, match_len, name)?;
                 }
 
                 if processed_matches == num_matches {
-                    eprintln!("Processed all {} matches for path: {}\n", num_matches, name);
-                    return Ok(total_gaf_entries);
+                    if verbose {
+                        eprintln!("Processed all {} matches for path: {} in {} pass(es)\n", num_matches, name, passes);
+                    }
+                    return Ok((total_gaf_entries, passes));
                 }
 
                 idx += 1;
@@ -458,9 +470,10 @@ fn walk_gfa(
     path_pos_file: &str,
     path_to_seq_id_map: HashMap<String, usize>,
     path_starts: Vec<usize>,
-    mut gaf_output: Option<std::fs::File>,
+    mut gaf_output: Option<BufWriter<File>>,
     mut callback: impl FnMut(usize, usize),
-    mut get_node_len: impl FnMut(usize) -> usize) -> std::io::Result<()>
+    mut get_node_len: impl FnMut(usize) -> usize,
+    verbose: bool) -> std::io::Result<()>
 {
     if let Some(ref mut file) = gaf_output {
         let header_line = "read_id\tread_st\tpath_str\tpath_len\tpath_st\tpath_end\tmatch_len\tpath_name";
@@ -475,6 +488,10 @@ fn walk_gfa(
 
     let mut line = String::new();
     let mut total_gaf_entries = 0;
+    let mut total_passes: u64 = 0;
+    let mut max_passes: u64 = 0;
+    let mut total_step_visits: u64 = 0;
+    let mut nonempty_seq_ids: u64 = 0;
 
     loop {
         line.clear();
@@ -521,8 +538,20 @@ fn walk_gfa(
             &mut gaf_output,
             &mut callback,
             &mut get_node_len,
+            verbose,
         ) {
-            Ok(entries) => total_gaf_entries += entries,
+            Ok((entries, passes)) => {
+                total_gaf_entries += entries;
+                if passes > 0 {
+                    nonempty_seq_ids += 1;
+                    total_passes += passes;
+                    max_passes = max_passes.max(passes);
+                    total_step_visits += passes * steps.len() as u64;
+                    if verbose {
+                        eprintln!("PASSES\t{}\t{}\t{}\t{}", positive_strand_seq_id, steps.len(), entries, passes);
+                    }
+                }
+            }
             Err(e) => eprintln!("Error processing path {}: {}", name, e),
         }
 
@@ -539,14 +568,33 @@ fn walk_gfa(
             &mut gaf_output,
             &mut callback,
             &mut get_node_len,
+            verbose,
         ) {
-            Ok(entries) => total_gaf_entries += entries,
+            Ok((entries, passes)) => {
+                total_gaf_entries += entries;
+                if passes > 0 {
+                    nonempty_seq_ids += 1;
+                    total_passes += passes;
+                    max_passes = max_passes.max(passes);
+                    total_step_visits += passes * steps.len() as u64;
+                    if verbose {
+                        eprintln!("PASSES\t{}\t{}\t{}\t{}", reverse_strand_seq_id, steps.len(), entries, passes);
+                    }
+                }
+            }
             Err(e) => eprintln!("Error processing path {}: {}", name, e),
         }
 
     }
+    if let Some(ref mut w) = gaf_output {
+        w.flush()?;
+    }
     eprintln!("---------------------");
     eprintln!("Total GAF entries: {}", total_gaf_entries);
+    eprintln!("Path-scan passes: total={} over {} seq_ids (mean={:.1}, max={}); step-visits≈{}",
+              total_passes, nonempty_seq_ids,
+              total_passes as f64 / nonempty_seq_ids.max(1) as f64,
+              max_passes, total_step_visits);
     Ok(())
 }
 
@@ -567,7 +615,7 @@ fn walk_gfa(
 ///
 /// # Returns
 /// A HashMap where the key is the path name and value is the 0-based line index
-fn read_path_name_indices(filename: &str) -> std::io::Result<HashMap<String, usize>> {
+fn read_path_name_indices(filename: &str, verbose: bool) -> std::io::Result<HashMap<String, usize>> {
     let mut path_indices = HashMap::new();
     let mut line_index = 0;
 
@@ -580,10 +628,11 @@ fn read_path_name_indices(filename: &str) -> std::io::Result<HashMap<String, usi
         line_index += 1;
     });
 
-    // Print the contents of the path_indices HashMap
-    eprintln!("Path indices map:");
-    for (path_name, index) in &path_indices {
-        eprintln!("  {}: {}", path_name, index);
+    if verbose {
+        eprintln!("Path indices map:");
+        for (path_name, index) in &path_indices {
+            eprintln!("  {}: {}", path_name, index);
+        }
     }
     eprintln!("Total paths: {}", path_indices.len());
 
@@ -625,6 +674,9 @@ struct Args {
     /// File prefix for coverage output (used when not generating GAF)
     #[arg(long)]
     coverage_prefix: Option<String>,
+    /// Print per-path / per-record progress to stderr
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn main() {
@@ -641,7 +693,7 @@ fn main() {
         // let seq_id_starts_map = read_seq_id_starts_map(seq_id_starts_file).unwrap();
 
         let seq_starts = read_cumulative_starts(seq_id_starts_file).unwrap();
-        let path_to_seq_id_map = read_path_name_indices(path_names_file_name).unwrap();
+        let path_to_seq_id_map = read_path_name_indices(path_names_file_name, args.verbose).unwrap();
 
         // Parse GFA file
         let (segment_lengths, min_id) = parse_gfa(&gfa_file).unwrap();
@@ -652,14 +704,15 @@ fn main() {
         // Create output file if file_prefix is provided
         let gaf_output = if let Some(prefix) = &args.gaf_file_prefix {
             let gaf_filename = format!("{}.gaf", prefix);
-            Some(std::fs::File::create(gaf_filename).expect("Could not create GAF output file"))
+            let f = File::create(gaf_filename).expect("Could not create GAF output file");
+            Some(BufWriter::with_capacity(1 << 20, f))
         } else {
             None
         };
 
         if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
             coverage[node_id - min_id] += len as f64;
-        }, |node_id| segment_lengths[node_id - min_id]) {
+        }, |node_id| segment_lengths[node_id - min_id], args.verbose) {
             eprintln!("Error processing GFA file with path positions: {}", e);
             std::process::exit(1);
         }
@@ -668,8 +721,10 @@ fn main() {
                                       args.gaf_file_prefix.as_deref()
                                           .or(args.coverage_prefix.as_deref())
                                           .unwrap_or("output"));
-        let mut output_file = std::fs::File::create(&output_filename)
-            .expect("Could not create coverage output file");
+        let mut output_file = BufWriter::with_capacity(
+            1 << 20,
+            File::create(&output_filename).expect("Could not create coverage output file"),
+        );
 
         // Write header
         writeln!(output_file, "node_id,node_coverage").unwrap();
@@ -684,6 +739,7 @@ fn main() {
             };
             writeln!(output_file, "{},{:.2}", node_id, coverage_value).unwrap();
         }
+        output_file.flush().expect("flush coverage output");
 
         eprintln!("Coverage data written to: {}", output_filename);
         return;
