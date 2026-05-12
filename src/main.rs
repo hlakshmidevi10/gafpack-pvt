@@ -17,7 +17,7 @@ struct Record {
     match_len: u32,
     read_st: u32,
     read_id: u32,
-    _pad: u32,
+    path_bp: u32, // bp offset of hit within seq_id's text (from find_mems seqOffset)
 }
 
 /// Iterates through each line in a file, applying the provided callback function
@@ -397,23 +397,24 @@ fn process_path_matches(
         eprintln!("Processing path: {}   seq_id: {}   st: {}   num_matches: {}", name, seq_id, st, num_matches);
     }
 
-    // Map node_id -> all step indices (ascending). The old multi-pass scan
-    // matched a record at the first occurrence >= its current for-loop cursor
-    // (wrapping to occurrence 0 on pass restart), and only advanced the cursor
-    // when node_id changed. Replicating that here keeps output byte-identical
-    // while turning O(passes * steps) (mean ~229 passes) into O(steps + records).
-    let mut step_index: HashMap<usize, Vec<usize>> = HashMap::with_capacity(steps.len());
-    for (i, step) in steps.iter().enumerate() {
+    // Pre-parse steps once: node_id per step + cumulative bp prefix sum.
+    // Per record, binary-search path_bp in cum_bp to land on the exact step
+    // that contains that bp -- unambiguous even when a node_id repeats.
+    let mut step_node_ids: Vec<usize> = Vec::with_capacity(steps.len());
+    let mut cum_bp: Vec<usize> = Vec::with_capacity(steps.len() + 1);
+    cum_bp.push(0);
+    for step in steps.iter() {
         let (seg, _orient) = step.split_at(step.len() - 1);
         let seg_id = seg.parse::<usize>().unwrap();
-        step_index.entry(seg_id).or_default().push(i);
+        step_node_ids.push(seg_id);
+        cum_bp.push(cum_bp.last().unwrap() + get_node_len(seg_id));
     }
+    let path_total_bp = *cum_bp.last().unwrap();
 
     let mut total_gaf_entries = 0;
     let mut path_str = String::with_capacity(64);
-    let mut cursor: usize = 0;
-    let mut prev_node_id: usize = usize::MAX;
-    let mut i: usize = 0;
+    let mut mismatch_node: u64 = 0;
+    let mut mismatch_off: u64 = 0;
 
     for idx in st..end {
         let r = &records[idx];
@@ -422,18 +423,27 @@ fn process_path_matches(
         let match_len = r.match_len as usize;
         let read_start = r.read_st as usize;
         let read_id = r.read_id as usize;
+        let path_bp = r.path_bp as usize;
 
-        if curr_node_id != prev_node_id {
-            let Some(occs) = step_index.get(&curr_node_id) else {
-                eprintln!("ERROR: node_id {} not on path {} (seq_id {}); skipping record idx {}",
-                          curr_node_id, name, seq_id, idx);
-                prev_node_id = usize::MAX;
-                continue;
-            };
-            let p = occs.partition_point(|&j| j < cursor);
-            i = if p < occs.len() { occs[p] } else { occs[0] };
-            cursor = i + 1;
-            prev_node_id = curr_node_id;
+        if path_bp >= path_total_bp {
+            eprintln!("ERROR: path_bp {} >= path length {} on path {} (seq_id {}); skipping record idx {}",
+                      path_bp, path_total_bp, name, seq_id, idx);
+            continue;
+        }
+        let i = cum_bp.partition_point(|&c| c <= path_bp) - 1;
+
+        if step_node_ids[i] != curr_node_id {
+            mismatch_node += 1;
+            if mismatch_node <= 5 {
+                eprintln!("WARN: path_bp {} -> step {} node {} != record node_id {} (path {})",
+                          path_bp, i, step_node_ids[i], curr_node_id, name);
+            }
+        } else if path_bp - cum_bp[i] != curr_offset {
+            mismatch_off += 1;
+            if mismatch_off <= 5 {
+                eprintln!("WARN: path_bp {} -> step {} local off {} != record offset {} (node {}, path {})",
+                          path_bp, i, path_bp - cum_bp[i], curr_offset, curr_node_id, name);
+            }
         }
 
         // todo: handle reverse strand traversal
@@ -458,6 +468,10 @@ fn process_path_matches(
         }
     }
 
+    if mismatch_node + mismatch_off > 0 {
+        eprintln!("path {}: {} node-id mismatches, {} offset mismatches (of {} records)",
+                  name, mismatch_node, mismatch_off, num_matches);
+    }
     if verbose {
         eprintln!("Processed all {} matches for path: {}\n", num_matches, name);
     }
