@@ -927,3 +927,260 @@ fn main() {
     }
 }
 
+// =============================================================================
+// v2 unit tests (see PLAN_find_mems_binary_io_v2.md, Gate 1).
+// Run with:  cargo test
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::cast_slice;
+
+    // -------------------------------------------------------------------------
+    // Gate 1a: record round-trip + bit-31 packing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn record_size_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<Record>(), 16);
+    }
+
+    #[test]
+    fn record_decodes_known_bytes() {
+        // Hand-encode 2 records, little-endian: path_bp, match_len, read_st, read_id
+        // Record 0: path_bp=0x01020304, match_len=30,       read_st=7, read_id=42
+        // Record 1: path_bp=u32::MAX,   match_len=20_000,   read_st=0, read_id=99
+        let bytes: [u8; 32] = [
+            // Record 0
+            0x04, 0x03, 0x02, 0x01,             // path_bp = 0x01020304
+            0x1E, 0x00, 0x00, 0x00,             // match_len = 30
+            0x07, 0x00, 0x00, 0x00,             // read_st = 7
+            0x2A, 0x00, 0x00, 0x00,             // read_id = 42
+            // Record 1
+            0xFF, 0xFF, 0xFF, 0xFF,             // path_bp = u32::MAX
+            0x20, 0x4E, 0x00, 0x00,             // match_len = 20_000
+            0x00, 0x00, 0x00, 0x00,             // read_st = 0
+            0x63, 0x00, 0x00, 0x00,             // read_id = 99
+        ];
+        let records: &[Record] = cast_slice(&bytes);
+        assert_eq!(records.len(), 2);
+
+        assert_eq!(records[0].path_bp, 0x01020304);
+        assert_eq!(records[0].match_len, 30);
+        assert_eq!(records[0].read_st, 7);
+        assert_eq!(records[0].read_id, 42);
+
+        assert_eq!(records[1].path_bp, u32::MAX);
+        assert_eq!(records[1].match_len, 20_000);
+        assert_eq!(records[1].read_st, 0);
+        assert_eq!(records[1].read_id, 99);
+    }
+
+    #[test]
+    fn record_match_len_full_u32_range() {
+        // Now that is_rev is gone, match_len uses the full u32 range.
+        // Reads are ~20Kbp in practice but we shouldn't artificially cap.
+        let cases: &[u32] = &[1, 20_000, 0x7FFF_FFFF, u32::MAX];
+        for &mlen in cases {
+            let r = Record { path_bp: 0, match_len: mlen, read_st: 0, read_id: 0 };
+            assert_eq!(r.match_len, mlen, "match_len round-trip failed for {}", mlen);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Gate 1b: walker derivation edge cases (advance_step_cursor)
+    //
+    // Synthetic fixture:
+    //   step_node_ids = [10, 20, 30, 40]
+    //   node lengths  = [ 5,  7,  1,  3]
+    //   cum_bp        = [ 0,  5, 12, 13, 16]   (path_total_bp = 16)
+    //
+    // For each test case we feed a single path_bp through the cursor and verify
+    // the derived (step_index, local_offset). step_node_ids[i] is the node_id,
+    // path_bp - cum_bp[i] is the offset. This is the exact derivation
+    // process_path_matches does.
+    // -------------------------------------------------------------------------
+
+    fn fixture_cum_bp() -> Vec<usize> {
+        vec![0, 5, 12, 13, 16]
+    }
+    fn fixture_node_ids() -> Vec<usize> {
+        vec![10, 20, 30, 40]
+    }
+    const FIXTURE_PATH_TOTAL_BP: usize = 16;
+
+    /// Run a single record through the cursor starting at i=0, return (i, offset)
+    /// or None if rejected by the path_total_bp guard.
+    fn derive_step(path_bp: usize, cum_bp: &[usize], path_total: usize) -> Option<(usize, usize)> {
+        if path_bp >= path_total { return None; }
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        advance_step_cursor(path_bp, cum_bp, &mut i, &mut cum);
+        Some((i, path_bp - cum))
+    }
+
+    #[test]
+    fn walker_e1_first_bp_of_first_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(0, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (10, 0));
+    }
+
+    #[test]
+    fn walker_e2_last_bp_of_first_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(4, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (10, 4));
+    }
+
+    #[test]
+    fn walker_e3_exact_step_boundary_into_new_step() {
+        // Critical off-by-one: path_bp == cum_bp[i+1] must land on step i+1,
+        // not step i. The while-condition `path_bp >= cum_bp[i+1]` enforces this.
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(5, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (20, 0));
+    }
+
+    #[test]
+    fn walker_e4_first_bp_inside_multi_bp_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(6, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (20, 1));
+    }
+
+    #[test]
+    fn walker_e5_last_bp_of_multi_bp_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(11, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (20, 6));
+    }
+
+    #[test]
+    fn walker_e6_entry_to_single_bp_node() {
+        // Cursor must advance to step 2 (length-1 node 30).
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(12, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (30, 0));
+    }
+
+    #[test]
+    fn walker_e7_exit_single_bp_node_into_next() {
+        // Cursor must advance to step 3, crossing the 1-bp node 30 cleanly.
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(13, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (40, 0));
+    }
+
+    #[test]
+    fn walker_e8_last_valid_bp_on_path() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(15, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (40, 2));
+    }
+
+    #[test]
+    fn walker_e9_one_past_end_rejected() {
+        let cum_bp = fixture_cum_bp();
+        assert!(derive_step(16, &cum_bp, FIXTURE_PATH_TOTAL_BP).is_none());
+    }
+
+    #[test]
+    fn walker_e10_past_end_rejected() {
+        let cum_bp = fixture_cum_bp();
+        assert!(derive_step(17, &cum_bp, FIXTURE_PATH_TOTAL_BP).is_none());
+    }
+
+    #[test]
+    fn walker_e11_u32_max_rejected_no_overflow() {
+        // u32::MAX as usize must be safely rejected without arithmetic overflow.
+        let cum_bp = fixture_cum_bp();
+        assert!(derive_step(u32::MAX as usize, &cum_bp, FIXTURE_PATH_TOTAL_BP).is_none());
+    }
+
+    // -------- Monotonic-cursor stress: simulate a full slice of records --------
+
+    #[test]
+    fn walker_monotonic_cursor_across_slice() {
+        // Records sorted by path_bp ascending, including repeats, exact
+        // boundaries, gaps. Mirrors the real per-bucket loop in
+        // process_path_matches. Asserts cursor is non-decreasing throughout
+        // AND derives the correct (node_id, offset) per record.
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let path_bps: &[usize] = &[0, 1, 1, 2, 5, 5, 5, 6, 12, 12, 13, 15];
+        let expected: &[(usize, usize)] = &[
+            (10, 0), (10, 1), (10, 1), (10, 2),
+            (20, 0), (20, 0), (20, 0), (20, 1),
+            (30, 0), (30, 0),
+            (40, 0), (40, 2),
+        ];
+        assert_eq!(path_bps.len(), expected.len());
+
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        let mut last_i = 0usize;
+
+        for (k, &pbp) in path_bps.iter().enumerate() {
+            advance_step_cursor(pbp, &cum_bp, &mut i, &mut cum);
+            assert!(i >= last_i,
+                "cursor moved backwards at record {}: i={} last_i={} path_bp={}",
+                k, i, last_i, pbp);
+            assert_eq!(cum, cum_bp[i],
+                "cum out of sync at record {}: cum={} cum_bp[{}]={}", k, cum, i, cum_bp[i]);
+            let off = pbp - cum;
+            assert_eq!((nodes[i], off), expected[k],
+                "wrong derivation at record {} (path_bp={})", k, pbp);
+            last_i = i;
+        }
+    }
+
+    #[test]
+    fn walker_isolation_between_calls() {
+        // The forward and reverse passes share `records` but call
+        // process_path_matches with DIFFERENT seq_ids => disjoint slices,
+        // and each call gets its own freshly-zeroed cursor. Verify by
+        // running advance_step_cursor twice "from scratch" on the same path,
+        // each time starting from i=0/cum=0.
+        let cum_bp = fixture_cum_bp();
+
+        // Call 1: walk records [0, 5, 12, 15]
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        for &pbp in &[0usize, 5, 12, 15] {
+            advance_step_cursor(pbp, &cum_bp, &mut i, &mut cum);
+        }
+        assert_eq!(i, 3);
+        assert_eq!(cum, 13);
+
+        // Call 2: simulate the second orientation -- cursor MUST start fresh
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        advance_step_cursor(0, &cum_bp, &mut i, &mut cum);
+        assert_eq!((i, cum), (0, 0),
+            "second call leaked state from first; cursor should restart at i=0");
+    }
+
+    #[test]
+    fn walker_single_step_path() {
+        // Degenerate path with 1 step, length 5. cum_bp = [0, 5].
+        // path_bps 0..=4 must all map to step 0, offset 0..=4. bp 5 must reject.
+        let cum_bp = vec![0usize, 5];
+        for pbp in 0..5 {
+            let mut i = 0usize;
+            let mut cum = 0usize;
+            advance_step_cursor(pbp, &cum_bp, &mut i, &mut cum);
+            assert_eq!(i, 0, "single-step path: i should never advance");
+            assert_eq!(pbp - cum, pbp);
+        }
+        assert!(derive_step(5, &cum_bp, 5).is_none());
+    }
+}
