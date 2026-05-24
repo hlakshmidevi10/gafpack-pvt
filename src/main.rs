@@ -8,17 +8,31 @@ use std::path::Path;
 use std::io::Write;
 use bytemuck::{Pod, Zeroable};
 
-/// On-disk record in `_path_pos.bin` (written by find_mems). Little-endian, 24 bytes.
+/// On-disk record in `_path_pos_v2.bin` (written by find_mems v2). Little-endian, 16 bytes.
+///
+/// See `mem-projection/pangenome-pipeline/PLAN_find_mems_binary_io_v2.md`.
+/// node_id and offset are NOT stored: gafpack derives them by walking the
+/// path's cum_bp prefix-sum and locating the step containing path_bp.
+/// Records are sorted by path_bp within each seq_id bucket so the walker
+/// can advance a single monotonic cursor (linear merge).
+///
+/// is_rev(graph_pos) from the BWT hit is NOT stored either. The GAF strand
+/// is the XOR of the bucket's path-strand (seq_id & 1) and the GFA step's
+/// +/- orientation; see traverse_nodes(). An earlier v2 draft stored a
+/// "sanity bit" in match_len bit 31 and asserted it equalled the bucket
+/// parity -- that conflated two independent strand concepts and silently
+/// dropped valid records. Don't reintroduce it.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Record {
-    node_id: u32,
-    offset_rev: u32, // bit 31 = is_rev, bits 0..30 = node-local offset
+    path_bp: u32,
     match_len: u32,
     read_st: u32,
     read_id: u32,
-    path_bp: u32, // bp offset of hit within seq_id's text (from find_mems seqOffset)
 }
+
+// Compile-time guarantee that the on-disk size stays 16 bytes.
+const _: () = assert!(std::mem::size_of::<Record>() == 16);
 
 /// Iterates through each line in a file, applying the provided callback function
 ///
@@ -165,6 +179,33 @@ fn parse_gfa(gfa_path: &str) -> std::io::Result<(Vec<usize>, usize)> {
     Ok((segment_lengths, min_id))
 }
 
+
+/// Advance a monotonic step cursor so that `cum_bp[*i] <= path_bp < cum_bp[*i+1]`.
+///
+/// Pure helper, extracted from `process_path_matches` so the derivation can be
+/// unit-tested in isolation. Called once per record in the v2 walker. Because
+/// records are sorted by `path_bp` ascending within a seq_id bucket, the cursor
+/// only advances forward across the whole bucket -- amortized O(1) per call.
+///
+/// Preconditions (debug-assert only; production callers guarantee them):
+/// - cum_bp.len() >= 2 (path has >= 1 step)
+/// - cum_bp[0] == 0 and cum_bp is non-decreasing
+/// - path_bp < *cum_bp.last() (caller filters path_bp >= path_total_bp)
+/// - *i < cum_bp.len() - 1
+/// - cum_bp[*i] <= path_bp (cursor never goes backwards)
+#[inline]
+fn advance_step_cursor(
+    path_bp: usize,
+    cum_bp: &[usize],
+    i: &mut usize,
+    cum: &mut usize,
+) {
+    let last_step = cum_bp.len() - 1; // == n_steps; cum_bp has n_steps+1 entries
+    while *i + 1 < last_step && path_bp >= cum_bp[*i + 1] {
+        *i += 1;
+        *cum = cum_bp[*i];
+    }
+}
 
 fn traverse_nodes(
     steps: &[&str],
@@ -371,6 +412,17 @@ fn read_cumulative_starts(filename: &str) -> std::io::Result<Vec<usize>> {
     Ok(cumulative_starts)
 }
 
+/// v2 path-walker: linear merge of records (sorted by path_bp ascending)
+/// against the path's steps (advanced via a monotonic cursor).
+///
+/// Invariant per iteration: cum_bp[i] <= r.path_bp < cum_bp[i+1].
+/// Cursor `i` is fresh per call -- the forward and reverse orientations get
+/// disjoint record slices (different seq_ids) and so disjoint walker state.
+/// Total work across the slice: O(steps + records), no per-record search.
+///
+/// Replaces the v1 cum_bp.partition_point() lookup. Also removes the v1
+/// mismatch_node/mismatch_off counters -- their underlying redundancy
+/// (storing node_id/offset alongside path_bp) is gone in v2.
 fn process_path_matches(
     steps: &[&str],
     seq_id: usize,
@@ -398,8 +450,6 @@ fn process_path_matches(
     }
 
     // Pre-parse steps once: node_id per step + cumulative bp prefix sum.
-    // Per record, binary-search path_bp in cum_bp to land on the exact step
-    // that contains that bp -- unambiguous even when a node_id repeats.
     let mut step_node_ids: Vec<usize> = Vec::with_capacity(steps.len());
     let mut cum_bp: Vec<usize> = Vec::with_capacity(steps.len() + 1);
     cum_bp.push(0);
@@ -410,43 +460,49 @@ fn process_path_matches(
         cum_bp.push(cum_bp.last().unwrap() + get_node_len(seg_id));
     }
     let path_total_bp = *cum_bp.last().unwrap();
+    let n_steps = step_node_ids.len();
+    debug_assert!(n_steps > 0, "path with zero steps");
 
     let mut total_gaf_entries = 0;
     let mut path_str = String::with_capacity(64);
-    let mut mismatch_node: u64 = 0;
-    let mut mismatch_off: u64 = 0;
+
+    // Sanity counter for out-of-range path_bp. Should be zero on healthy runs.
+    let mut path_bp_out_of_range: u64 = 0;
+
+    // Monotonic step cursor: i = current step index, cum = cum_bp[i].
+    // Records are sorted by path_bp ascending within this bucket, so i
+    // only ever advances forward. Amortized O(1) per record.
+    let mut i: usize = 0;
+    let mut cum: usize = 0;
 
     for idx in st..end {
         let r = &records[idx];
-        let curr_node_id = r.node_id as usize;
-        let curr_offset = (r.offset_rev & 0x7FFF_FFFF) as usize;
+        let path_bp = r.path_bp as usize;
         let match_len = r.match_len as usize;
         let read_start = r.read_st as usize;
         let read_id = r.read_id as usize;
-        let path_bp = r.path_bp as usize;
 
+        // path_bp >= path_total_bp: hit lands past the end of the path.
+        // Preserved from v1; same behavior, same threshold (>=, not >).
         if path_bp >= path_total_bp {
-            eprintln!("ERROR: path_bp {} >= path length {} on path {} (seq_id {}); skipping record idx {}",
-                      path_bp, path_total_bp, name, seq_id, idx);
+            path_bp_out_of_range += 1;
+            if path_bp_out_of_range <= 5 {
+                eprintln!("ERROR: path_bp {} >= path length {} on path {} (seq_id {}); skipping record idx {}",
+                          path_bp, path_total_bp, name, seq_id, idx);
+            }
             continue;
         }
-        let i = cum_bp.partition_point(|&c| c <= path_bp) - 1;
 
-        if step_node_ids[i] != curr_node_id {
-            mismatch_node += 1;
-            if mismatch_node <= 5 {
-                eprintln!("WARN: path_bp {} -> step {} node {} != record node_id {} (path {})",
-                          path_bp, i, step_node_ids[i], curr_node_id, name);
-            }
-        } else if path_bp - cum_bp[i] != curr_offset {
-            mismatch_off += 1;
-            if mismatch_off <= 5 {
-                eprintln!("WARN: path_bp {} -> step {} local off {} != record offset {} (node {}, path {})",
-                          path_bp, i, path_bp - cum_bp[i], curr_offset, curr_node_id, name);
-            }
-        }
+        // Advance the cursor so cum_bp[i] <= path_bp < cum_bp[i+1].
+        // Pure logic extracted to advance_step_cursor() for unit-testing
+        // (see test_walker_*.) Records are sorted ascending in path_bp, so
+        // this advances at most n_steps times in TOTAL across the slice.
+        advance_step_cursor(path_bp, &cum_bp, &mut i, &mut cum);
+        debug_assert!(cum_bp[i] <= path_bp);
+        debug_assert!(path_bp < cum_bp[i + 1]);
 
-        // todo: handle reverse strand traversal
+        let curr_offset = path_bp - cum;
+
         path_str.clear();
         let path_len = traverse_nodes(&steps[i..], callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
         let path_start = curr_offset;
@@ -468,9 +524,9 @@ fn process_path_matches(
         }
     }
 
-    if mismatch_node + mismatch_off > 0 {
-        eprintln!("path {}: {} node-id mismatches, {} offset mismatches (of {} records)",
-                  name, mismatch_node, mismatch_off, num_matches);
+    if path_bp_out_of_range > 0 {
+        eprintln!("path {}: {} path_bp-out-of-range (of {} records)",
+                  name, path_bp_out_of_range, num_matches);
     }
     if verbose {
         eprintln!("Processed all {} matches for path: {}\n", num_matches, name);
@@ -495,9 +551,19 @@ fn walk_gfa(
     let path = Path::new(gfa_path);
     let mut reader = create_reader(path)?;
 
+    // v2: _path_pos_v2.bin is a contiguous array of 16-byte Records. Cast in
+    // place -- bytemuck guarantees alignment + layout via Pod/Zeroable.
     let bytes = std::fs::read(path_pos_file)?;
+    if bytes.len() % std::mem::size_of::<Record>() != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("path_pos file size {} is not a multiple of {} (Record size). \
+                     Expected v2 format (_path_pos_v2.bin). Is this a v1 file?",
+                    bytes.len(), std::mem::size_of::<Record>())));
+    }
     let records: &[Record] = bytemuck::cast_slice(&bytes);
-    eprintln!("Loaded {} path_pos records ({} bytes)", records.len(), bytes.len());
+    eprintln!("Loaded {} path_pos records ({} bytes, {} B/record)",
+              records.len(), bytes.len(), std::mem::size_of::<Record>());
 
     let mut line = String::new();
     let mut total_gaf_entries = 0;
@@ -672,7 +738,8 @@ struct Args {
     /// Weight coverage by query group occurrences
     #[arg(short = 'w', long)]
     weight_queries: bool,
-    /// Path positions TSV file
+    /// Path positions binary file (find_mems v2 output: _path_pos_v2.bin).
+    /// Records are 16 bytes each: path_bp, match_len_rev, read_st, read_id.
     #[arg(long)]
     path_pos: Option<String>,
     /// Sequence ID starts file
@@ -857,5 +924,263 @@ fn main() {
             );
         }
         eprintln!();
+    }
+}
+
+// =============================================================================
+// v2 unit tests (see PLAN_find_mems_binary_io_v2.md, Gate 1).
+// Run with:  cargo test
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::cast_slice;
+
+    // -------------------------------------------------------------------------
+    // Gate 1a: record round-trip + bit-31 packing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn record_size_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<Record>(), 16);
+    }
+
+    #[test]
+    fn record_decodes_known_bytes() {
+        // Hand-encode 2 records, little-endian: path_bp, match_len, read_st, read_id
+        // Record 0: path_bp=0x01020304, match_len=30,       read_st=7, read_id=42
+        // Record 1: path_bp=u32::MAX,   match_len=20_000,   read_st=0, read_id=99
+        let bytes: [u8; 32] = [
+            // Record 0
+            0x04, 0x03, 0x02, 0x01,             // path_bp = 0x01020304
+            0x1E, 0x00, 0x00, 0x00,             // match_len = 30
+            0x07, 0x00, 0x00, 0x00,             // read_st = 7
+            0x2A, 0x00, 0x00, 0x00,             // read_id = 42
+            // Record 1
+            0xFF, 0xFF, 0xFF, 0xFF,             // path_bp = u32::MAX
+            0x20, 0x4E, 0x00, 0x00,             // match_len = 20_000
+            0x00, 0x00, 0x00, 0x00,             // read_st = 0
+            0x63, 0x00, 0x00, 0x00,             // read_id = 99
+        ];
+        let records: &[Record] = cast_slice(&bytes);
+        assert_eq!(records.len(), 2);
+
+        assert_eq!(records[0].path_bp, 0x01020304);
+        assert_eq!(records[0].match_len, 30);
+        assert_eq!(records[0].read_st, 7);
+        assert_eq!(records[0].read_id, 42);
+
+        assert_eq!(records[1].path_bp, u32::MAX);
+        assert_eq!(records[1].match_len, 20_000);
+        assert_eq!(records[1].read_st, 0);
+        assert_eq!(records[1].read_id, 99);
+    }
+
+    #[test]
+    fn record_match_len_full_u32_range() {
+        // Now that is_rev is gone, match_len uses the full u32 range.
+        // Reads are ~20Kbp in practice but we shouldn't artificially cap.
+        let cases: &[u32] = &[1, 20_000, 0x7FFF_FFFF, u32::MAX];
+        for &mlen in cases {
+            let r = Record { path_bp: 0, match_len: mlen, read_st: 0, read_id: 0 };
+            assert_eq!(r.match_len, mlen, "match_len round-trip failed for {}", mlen);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Gate 1b: walker derivation edge cases (advance_step_cursor)
+    //
+    // Synthetic fixture:
+    //   step_node_ids = [10, 20, 30, 40]
+    //   node lengths  = [ 5,  7,  1,  3]
+    //   cum_bp        = [ 0,  5, 12, 13, 16]   (path_total_bp = 16)
+    //
+    // For each test case we feed a single path_bp through the cursor and verify
+    // the derived (step_index, local_offset). step_node_ids[i] is the node_id,
+    // path_bp - cum_bp[i] is the offset. This is the exact derivation
+    // process_path_matches does.
+    // -------------------------------------------------------------------------
+
+    fn fixture_cum_bp() -> Vec<usize> {
+        vec![0, 5, 12, 13, 16]
+    }
+    fn fixture_node_ids() -> Vec<usize> {
+        vec![10, 20, 30, 40]
+    }
+    const FIXTURE_PATH_TOTAL_BP: usize = 16;
+
+    /// Run a single record through the cursor starting at i=0, return (i, offset)
+    /// or None if rejected by the path_total_bp guard.
+    fn derive_step(path_bp: usize, cum_bp: &[usize], path_total: usize) -> Option<(usize, usize)> {
+        if path_bp >= path_total { return None; }
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        advance_step_cursor(path_bp, cum_bp, &mut i, &mut cum);
+        Some((i, path_bp - cum))
+    }
+
+    #[test]
+    fn walker_e1_first_bp_of_first_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(0, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (10, 0));
+    }
+
+    #[test]
+    fn walker_e2_last_bp_of_first_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(4, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (10, 4));
+    }
+
+    #[test]
+    fn walker_e3_exact_step_boundary_into_new_step() {
+        // Critical off-by-one: path_bp == cum_bp[i+1] must land on step i+1,
+        // not step i. The while-condition `path_bp >= cum_bp[i+1]` enforces this.
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(5, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (20, 0));
+    }
+
+    #[test]
+    fn walker_e4_first_bp_inside_multi_bp_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(6, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (20, 1));
+    }
+
+    #[test]
+    fn walker_e5_last_bp_of_multi_bp_node() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(11, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (20, 6));
+    }
+
+    #[test]
+    fn walker_e6_entry_to_single_bp_node() {
+        // Cursor must advance to step 2 (length-1 node 30).
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(12, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (30, 0));
+    }
+
+    #[test]
+    fn walker_e7_exit_single_bp_node_into_next() {
+        // Cursor must advance to step 3, crossing the 1-bp node 30 cleanly.
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(13, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (40, 0));
+    }
+
+    #[test]
+    fn walker_e8_last_valid_bp_on_path() {
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let (i, off) = derive_step(15, &cum_bp, FIXTURE_PATH_TOTAL_BP).unwrap();
+        assert_eq!((nodes[i], off), (40, 2));
+    }
+
+    #[test]
+    fn walker_e9_one_past_end_rejected() {
+        let cum_bp = fixture_cum_bp();
+        assert!(derive_step(16, &cum_bp, FIXTURE_PATH_TOTAL_BP).is_none());
+    }
+
+    #[test]
+    fn walker_e10_past_end_rejected() {
+        let cum_bp = fixture_cum_bp();
+        assert!(derive_step(17, &cum_bp, FIXTURE_PATH_TOTAL_BP).is_none());
+    }
+
+    #[test]
+    fn walker_e11_u32_max_rejected_no_overflow() {
+        // u32::MAX as usize must be safely rejected without arithmetic overflow.
+        let cum_bp = fixture_cum_bp();
+        assert!(derive_step(u32::MAX as usize, &cum_bp, FIXTURE_PATH_TOTAL_BP).is_none());
+    }
+
+    // -------- Monotonic-cursor stress: simulate a full slice of records --------
+
+    #[test]
+    fn walker_monotonic_cursor_across_slice() {
+        // Records sorted by path_bp ascending, including repeats, exact
+        // boundaries, gaps. Mirrors the real per-bucket loop in
+        // process_path_matches. Asserts cursor is non-decreasing throughout
+        // AND derives the correct (node_id, offset) per record.
+        let cum_bp = fixture_cum_bp();
+        let nodes = fixture_node_ids();
+        let path_bps: &[usize] = &[0, 1, 1, 2, 5, 5, 5, 6, 12, 12, 13, 15];
+        let expected: &[(usize, usize)] = &[
+            (10, 0), (10, 1), (10, 1), (10, 2),
+            (20, 0), (20, 0), (20, 0), (20, 1),
+            (30, 0), (30, 0),
+            (40, 0), (40, 2),
+        ];
+        assert_eq!(path_bps.len(), expected.len());
+
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        let mut last_i = 0usize;
+
+        for (k, &pbp) in path_bps.iter().enumerate() {
+            advance_step_cursor(pbp, &cum_bp, &mut i, &mut cum);
+            assert!(i >= last_i,
+                "cursor moved backwards at record {}: i={} last_i={} path_bp={}",
+                k, i, last_i, pbp);
+            assert_eq!(cum, cum_bp[i],
+                "cum out of sync at record {}: cum={} cum_bp[{}]={}", k, cum, i, cum_bp[i]);
+            let off = pbp - cum;
+            assert_eq!((nodes[i], off), expected[k],
+                "wrong derivation at record {} (path_bp={})", k, pbp);
+            last_i = i;
+        }
+    }
+
+    #[test]
+    fn walker_isolation_between_calls() {
+        // The forward and reverse passes share `records` but call
+        // process_path_matches with DIFFERENT seq_ids => disjoint slices,
+        // and each call gets its own freshly-zeroed cursor. Verify by
+        // running advance_step_cursor twice "from scratch" on the same path,
+        // each time starting from i=0/cum=0.
+        let cum_bp = fixture_cum_bp();
+
+        // Call 1: walk records [0, 5, 12, 15]
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        for &pbp in &[0usize, 5, 12, 15] {
+            advance_step_cursor(pbp, &cum_bp, &mut i, &mut cum);
+        }
+        assert_eq!(i, 3);
+        assert_eq!(cum, 13);
+
+        // Call 2: simulate the second orientation -- cursor MUST start fresh
+        let mut i = 0usize;
+        let mut cum = 0usize;
+        advance_step_cursor(0, &cum_bp, &mut i, &mut cum);
+        assert_eq!((i, cum), (0, 0),
+            "second call leaked state from first; cursor should restart at i=0");
+    }
+
+    #[test]
+    fn walker_single_step_path() {
+        // Degenerate path with 1 step, length 5. cum_bp = [0, 5].
+        // path_bps 0..=4 must all map to step 0, offset 0..=4. bp 5 must reject.
+        let cum_bp = vec![0usize, 5];
+        for pbp in 0..5 {
+            let mut i = 0usize;
+            let mut cum = 0usize;
+            advance_step_cursor(pbp, &cum_bp, &mut i, &mut cum);
+            assert_eq!(i, 0, "single-step path: i should never advance");
+            assert_eq!(pbp - cum, pbp);
+        }
+        assert!(derive_step(5, &cum_bp, 5).is_none());
     }
 }
