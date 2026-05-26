@@ -1,7 +1,7 @@
 use std::cmp::min;
 use clap::Parser;
 use flate2::read::GzDecoder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{prelude::*, BufReader, BufWriter};
 use std::path::Path;
@@ -433,6 +433,12 @@ fn process_path_matches(
     gaf_output: &mut Option<BufWriter<File>>,
     callback: &mut impl FnMut(usize, usize),
     get_node_len: &mut impl FnMut(usize) -> usize,
+    // When Some, dedup records by (read_id, read_st, starting_node_id).
+    // Each triple contributes coverage/GAF output exactly once across the
+    // whole gafpack run; subsequent records with the same triple are skipped.
+    // See the --dedup-read-node CLI flag for rationale.
+    dedup_seen: &mut Option<HashSet<(u32, u32, usize)>>,
+    dedup_skipped: &mut u64,
     verbose: bool,
 ) -> std::io::Result<(usize, u64)> {
 
@@ -501,6 +507,21 @@ fn process_path_matches(
         debug_assert!(cum_bp[i] <= path_bp);
         debug_assert!(path_bp < cum_bp[i + 1]);
 
+        // Dedup check (--dedup-read-node). After cursor advance, step_node_ids[i]
+        // is the starting graph node for this record's MEM walk. Two records
+        // sharing (read_id, read_st, starting_node_id) correspond to the same
+        // (read, MEM-position, starting-graph-node), which by the find_mems
+        // dedup semantics (and the GFAffix normalization invariant) projects
+        // to the same normalized path string. Drop the duplicate -- skip
+        // traverse_nodes (no coverage accumulation) and skip GAF emission.
+        if let Some(seen) = dedup_seen.as_mut() {
+            let key = (r.read_id, r.read_st, step_node_ids[i]);
+            if !seen.insert(key) {
+                *dedup_skipped += 1;
+                continue;
+            }
+        }
+
         let curr_offset = path_bp - cum;
 
         path_str.clear();
@@ -542,6 +563,9 @@ fn walk_gfa(
     mut gaf_output: Option<BufWriter<File>>,
     mut callback: impl FnMut(usize, usize),
     mut get_node_len: impl FnMut(usize) -> usize,
+    // When true, dedup (read_id, read_st, starting_node_id) triples across
+    // the whole run. See process_path_matches() for details.
+    dedup_read_node: bool,
     verbose: bool) -> std::io::Result<()>
 {
     if let Some(ref mut file) = gaf_output {
@@ -571,6 +595,18 @@ fn walk_gfa(
     let mut max_passes: u64 = 0;
     let mut total_step_visits: u64 = 0;
     let mut nonempty_seq_ids: u64 = 0;
+
+    // Dedup state. None disables dedup (default). Some(set) is shared across
+    // ALL paths/seq_ids so cross-bucket duplicates (the common case from
+    // lightweight find_mems) are caught. Sized to records.len() / 2 as an
+    // initial guess: after dedup, count is typically 60-80% of input.
+    let mut dedup_seen: Option<HashSet<(u32, u32, usize)>> = if dedup_read_node {
+        eprintln!("Dedup mode: (read_id, read_st, starting_node_id) — enabled");
+        Some(HashSet::with_capacity(records.len() / 2 + 16))
+    } else {
+        None
+    };
+    let mut dedup_skipped: u64 = 0;
 
     loop {
         line.clear();
@@ -617,6 +653,8 @@ fn walk_gfa(
             &mut gaf_output,
             &mut callback,
             &mut get_node_len,
+            &mut dedup_seen,
+            &mut dedup_skipped,
             verbose,
         ) {
             Ok((entries, passes)) => {
@@ -647,6 +685,8 @@ fn walk_gfa(
             &mut gaf_output,
             &mut callback,
             &mut get_node_len,
+            &mut dedup_seen,
+            &mut dedup_skipped,
             verbose,
         ) {
             Ok((entries, passes)) => {
@@ -674,6 +714,23 @@ fn walk_gfa(
               total_passes, nonempty_seq_ids,
               total_passes as f64 / nonempty_seq_ids.max(1) as f64,
               max_passes, total_step_visits);
+    if let Some(seen) = dedup_seen.as_ref() {
+        let total_records = records.len();
+        let kept = total_records as i64 - dedup_skipped as i64;
+        eprintln!("Dedup: {} unique (read_id, read_st, starting_node_id) triples; \
+                   {} duplicates skipped ({:.2}% of {} records)",
+                  seen.len(), dedup_skipped,
+                  100.0 * dedup_skipped as f64 / total_records as f64,
+                  total_records);
+        // Sanity: number of inserts == number of kept records.
+        // (kept == seen.len() if every kept record produced a new triple,
+        //  which it does by construction.)
+        if seen.len() as i64 != kept {
+            eprintln!("WARN: dedup set size ({}) != kept records ({}); \
+                       this should not happen — please report",
+                      seen.len(), kept);
+        }
+    }
     Ok(())
 }
 
@@ -757,6 +814,16 @@ struct Args {
     /// Print per-path / per-record progress to stderr
     #[arg(short, long)]
     verbose: bool,
+    /// Dedup (read_id, read_st, starting_node_id) triples when processing
+    /// _path_pos_v2.bin input. Each unique triple contributes to coverage
+    /// and GAF output exactly once; later records with the same triple are
+    /// skipped. Intended for use with find_mems --lightweight-tags, whose
+    /// output contains intra-MEM same-node duplicates (one per tag run
+    /// sharing the same graph_pos within a MEM). Off by default: changes
+    /// coverage semantics for any caller relying on per-haplotype duplicate
+    /// records counting multiple times.
+    #[arg(long)]
+    dedup_read_node: bool,
 }
 
 fn main() {
@@ -792,7 +859,7 @@ fn main() {
 
         if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
             coverage[node_id - min_id] += len as f64;
-        }, |node_id| segment_lengths[node_id - min_id], args.verbose) {
+        }, |node_id| segment_lengths[node_id - min_id], args.dedup_read_node, args.verbose) {
             eprintln!("Error processing GFA file with path positions: {}", e);
             std::process::exit(1);
         }
