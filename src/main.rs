@@ -532,6 +532,7 @@ fn process_path_matches(
                 | ((r.read_st as u64) << 20)
                 | ((step_node_ids[i] as u64) << 29)
                 | ((curr_offset as u64) << 54);
+            // Layout uses all 64 bits; see walk_gfa() for field-width caps.
             if !seen.insert(key) {
                 *dedup_skipped += 1;
                 continue;
@@ -615,12 +616,11 @@ fn walk_gfa(
     // lightweight find_mems) are caught. Sized to records.len() / 2 as an
     // initial guess: after dedup, count is typically 60-80% of input.
     //
-    // Packed u64 key layout (low → high):
+    // Packed u64 key layout (low → high; all 64 bits used):
     //   bits [ 0..20):  read_id  (max 1,048,575 -- pipeline runs 500K reads)
     //   bits [20..29):  read_st  (max     511   -- short reads, ≤300 bp)
     //   bits [29..54):  node_id  (max 33,554,431 -- HPRCv2 chr6 uses ~18M)
-    //   bits [54..63):  offset   (max     511   -- node lengths capped <512)
-    //   bit  [63]:      reserved
+    //   bits [54..64):  offset   (max     1023  -- node lengths capped ≤1024)
     //
     // Why packed: HashSet<u64> is 8 B/slot vs. 16 B for (u32,u32,usize) and
     // hashes a single word. At 60.7M unique keys (HPRCv2 chr6), that's
@@ -867,7 +867,7 @@ struct Args {
     ///
     /// Key is packed into a u64 with field-width caps enforced at load time:
     /// read_id < 2^20 (1M reads), read_st < 2^9 (512 bp), node_id < 2^25
-    /// (33M nodes), offset < 2^9 (512 bp node length). Violations abort.
+    /// (33M nodes), offset < 2^10 (node length ≤1024 bp). Violations abort.
     #[arg(long)]
     dedup_read_node: bool,
 }
@@ -901,8 +901,9 @@ fn main() {
             assert!(max_node_id < (1usize << 25),
                 "node_id {} exceeds 25-bit packed dedup field (cap 33,554,431)",
                 max_node_id);
-            assert!(max_node_len < 512,
-                "node length {} exceeds 9-bit packed offset field (cap 511)",
+            assert!(max_node_len <= 1024,
+                "node length {} exceeds 10-bit packed offset field \
+                 (offsets 0..1023 → node length cap 1024)",
                 max_node_len);
         }
 
