@@ -433,11 +433,13 @@ fn process_path_matches(
     gaf_output: &mut Option<BufWriter<File>>,
     callback: &mut impl FnMut(usize, usize),
     get_node_len: &mut impl FnMut(usize) -> usize,
-    // When Some, dedup records by (read_id, read_st, starting_node_id).
-    // Each triple contributes coverage/GAF output exactly once across the
-    // whole gafpack run; subsequent records with the same triple are skipped.
-    // See the --dedup-read-node CLI flag for rationale.
-    dedup_seen: &mut Option<HashSet<(u32, u32, usize)>>,
+    // When Some, dedup records by (read_id, read_st, starting_node_id, offset)
+    // packed into a single u64 -- see walk_gfa() for the bit layout and the
+    // load-time field-width asserts. Each unique 4-tuple contributes coverage
+    // and GAF output exactly once across the whole gafpack run; subsequent
+    // records with the same key are skipped. See the --dedup-read-node CLI
+    // flag for rationale.
+    dedup_seen: &mut Option<HashSet<u64>>,
     dedup_skipped: &mut u64,
     verbose: bool,
 ) -> std::io::Result<(usize, u64)> {
@@ -507,22 +509,34 @@ fn process_path_matches(
         debug_assert!(cum_bp[i] <= path_bp);
         debug_assert!(path_bp < cum_bp[i + 1]);
 
+        let curr_offset = path_bp - cum;
+
         // Dedup check (--dedup-read-node). After cursor advance, step_node_ids[i]
-        // is the starting graph node for this record's MEM walk. Two records
-        // sharing (read_id, read_st, starting_node_id) correspond to the same
-        // (read, MEM-position, starting-graph-node), which by the find_mems
-        // dedup semantics (and the GFAffix normalization invariant) projects
-        // to the same normalized path string. Drop the duplicate -- skip
-        // traverse_nodes (no coverage accumulation) and skip GAF emission.
+        // is the starting graph node and curr_offset is the intra-node offset
+        // for this record's MEM walk. Two records sharing (read_id, read_st,
+        // starting_node_id, offset) correspond to the same physical graph
+        // position for the same read coordinate -- the intended duplicate
+        // class emitted by find_mems --lightweight-tags (one record per tag
+        // run sharing the same graph_pos within a MEM). Including offset
+        // tightens dedup to true graph-position collisions; earlier versions
+        // keyed on starting-node alone and silently collapsed records that
+        // started at the same node but at different offsets.
+        //
+        // Key is packed into a u64 (vs. a 16-byte tuple); see walk_gfa() for
+        // the bit layout and field-width asserts. HashSet<u64> hashes a
+        // single word (cheaper than tuple hashing) and halves per-entry
+        // memory: at HPRCv2 chr6 scale (60.7M unique triples), 625 MB vs.
+        // 1.18 GB for the prior (u32, u32, usize) tuple key.
         if let Some(seen) = dedup_seen.as_mut() {
-            let key = (r.read_id, r.read_st, step_node_ids[i]);
+            let key = (r.read_id as u64)
+                | ((r.read_st as u64) << 20)
+                | ((step_node_ids[i] as u64) << 29)
+                | ((curr_offset as u64) << 54);
             if !seen.insert(key) {
                 *dedup_skipped += 1;
                 continue;
             }
         }
-
-        let curr_offset = path_bp - cum;
 
         path_str.clear();
         let path_len = traverse_nodes(&steps[i..], callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
@@ -600,8 +614,36 @@ fn walk_gfa(
     // ALL paths/seq_ids so cross-bucket duplicates (the common case from
     // lightweight find_mems) are caught. Sized to records.len() / 2 as an
     // initial guess: after dedup, count is typically 60-80% of input.
-    let mut dedup_seen: Option<HashSet<(u32, u32, usize)>> = if dedup_read_node {
-        eprintln!("Dedup mode: (read_id, read_st, starting_node_id) — enabled");
+    //
+    // Packed u64 key layout (low → high):
+    //   bits [ 0..20):  read_id  (max 1,048,575 -- pipeline runs 500K reads)
+    //   bits [20..29):  read_st  (max     511   -- short reads, ≤300 bp)
+    //   bits [29..54):  node_id  (max 33,554,431 -- HPRCv2 chr6 uses ~18M)
+    //   bits [54..63):  offset   (max     511   -- node lengths capped <512)
+    //   bit  [63]:      reserved
+    //
+    // Why packed: HashSet<u64> is 8 B/slot vs. 16 B for (u32,u32,usize) and
+    // hashes a single word. At 60.7M unique keys (HPRCv2 chr6), that's
+    // ~625 MB vs. ~1.18 GB -- a 12% RSS shave on the 4.6 GB peak.
+    //
+    // Field-width asserts (below) convert silent overflow into loud failure.
+    // Strand is intentionally NOT in the key: a fwd-bucket and rev-bucket
+    // record landing on the same (node, offset) for the same (read, read_st)
+    // would represent the same physical graph hit; if they did differ in
+    // strand interpretation, find_mems should not have emitted both for a
+    // single read coordinate.
+    if dedup_read_node {
+        let max_read_id = records.iter().map(|r| r.read_id).max().unwrap_or(0);
+        let max_read_st = records.iter().map(|r| r.read_st).max().unwrap_or(0);
+        assert!(max_read_id < (1u32 << 20),
+            "read_id {} exceeds 20-bit packed dedup field (cap 1,048,575); \
+             pipeline contract is 500K reads/run", max_read_id);
+        assert!(max_read_st < (1u32 << 9),
+            "read_st {} exceeds 9-bit packed dedup field (cap 511); \
+             contract is short reads ≤300 bp", max_read_st);
+    }
+    let mut dedup_seen: Option<HashSet<u64>> = if dedup_read_node {
+        eprintln!("Dedup mode: (read_id, read_st, starting_node_id, offset) — enabled");
         Some(HashSet::with_capacity(records.len() / 2 + 16))
     } else {
         None
@@ -717,7 +759,7 @@ fn walk_gfa(
     if let Some(seen) = dedup_seen.as_ref() {
         let total_records = records.len();
         let kept = total_records as i64 - dedup_skipped as i64;
-        eprintln!("Dedup: {} unique (read_id, read_st, starting_node_id) triples; \
+        eprintln!("Dedup: {} unique (read_id, read_st, starting_node_id, offset) keys; \
                    {} duplicates skipped ({:.2}% of {} records)",
                   seen.len(), dedup_skipped,
                   100.0 * dedup_skipped as f64 / total_records as f64,
@@ -814,14 +856,18 @@ struct Args {
     /// Print per-path / per-record progress to stderr
     #[arg(short, long)]
     verbose: bool,
-    /// Dedup (read_id, read_st, starting_node_id) triples when processing
-    /// _path_pos_v2.bin input. Each unique triple contributes to coverage
-    /// and GAF output exactly once; later records with the same triple are
-    /// skipped. Intended for use with find_mems --lightweight-tags, whose
-    /// output contains intra-MEM same-node duplicates (one per tag run
-    /// sharing the same graph_pos within a MEM). Off by default: changes
-    /// coverage semantics for any caller relying on per-haplotype duplicate
-    /// records counting multiple times.
+    /// Dedup (read_id, read_st, starting_node_id, offset) tuples when
+    /// processing _path_pos_v2.bin input. Each unique 4-tuple contributes
+    /// to coverage and GAF output exactly once; later records with the same
+    /// key are skipped. Intended for use with find_mems --lightweight-tags,
+    /// whose output contains intra-MEM same-graph-position duplicates (one
+    /// per tag run sharing the same graph_pos within a MEM). Off by default:
+    /// changes coverage semantics for any caller relying on per-haplotype
+    /// duplicate records counting multiple times.
+    ///
+    /// Key is packed into a u64 with field-width caps enforced at load time:
+    /// read_id < 2^20 (1M reads), read_st < 2^9 (512 bp), node_id < 2^25
+    /// (33M nodes), offset < 2^9 (512 bp node length). Violations abort.
     #[arg(long)]
     dedup_read_node: bool,
 }
@@ -845,6 +891,20 @@ fn main() {
         // Parse GFA file
         let (segment_lengths, min_id) = parse_gfa(&gfa_file).unwrap();
         let num_segments = segment_lengths.len();       // segment -> node
+
+        // Field-width contract for the packed dedup key (see walk_gfa()).
+        // Checked here (not in parse_gfa) because the GAF-input mode doesn't
+        // use the packed key and shouldn't be constrained by it.
+        if args.dedup_read_node {
+            let max_node_id = min_id + num_segments - 1;
+            let max_node_len = segment_lengths.iter().copied().max().unwrap_or(0);
+            assert!(max_node_id < (1usize << 25),
+                "node_id {} exceeds 25-bit packed dedup field (cap 33,554,431)",
+                max_node_id);
+            assert!(max_node_len < 512,
+                "node length {} exceeds 9-bit packed offset field (cap 511)",
+                max_node_len);
+        }
 
         let mut coverage: Vec<f64> = vec![0.0; num_segments];
 
