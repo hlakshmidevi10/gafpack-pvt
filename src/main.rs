@@ -441,6 +441,12 @@ fn process_path_matches(
     // flag for rationale.
     dedup_seen: &mut Option<HashSet<u64>>,
     dedup_skipped: &mut u64,
+    // Minimum raw GFA node_id; subtracted from the starting node before
+    // packing into the dedup key so the 25-bit field stores a min_id-relative
+    // value (range 0..=max_id-min_id) rather than the raw id. Some graph
+    // builds (e.g. cactus-mc) use sparse node-id ranges where raw max_id
+    // overflows 25 bits even though (max_id - min_id) fits comfortably.
+    min_node_id: usize,
     verbose: bool,
 ) -> std::io::Result<(usize, u64)> {
 
@@ -528,9 +534,15 @@ fn process_path_matches(
         // memory: at HPRCv2 chr6 scale (60.7M unique triples), 625 MB vs.
         // 1.18 GB for the prior (u32, u32, usize) tuple key.
         if let Some(seen) = dedup_seen.as_mut() {
+            // Pack (node_id - min_node_id) instead of raw node_id: see the
+            // min_node_id parameter doc and walk_gfa()'s key-layout comment.
+            // Subtraction is safe because step_node_ids[i] >= min_node_id by
+            // construction (every step's node_id came from parse_gfa, which
+            // also sourced min_id).
+            let rel_node_id = step_node_ids[i] - min_node_id;
             let key = (r.read_id as u64)
                 | ((r.read_st as u64) << 20)
-                | ((step_node_ids[i] as u64) << 29)
+                | ((rel_node_id as u64) << 29)
                 | ((curr_offset as u64) << 54);
             // Layout uses all 64 bits; see walk_gfa() for field-width caps.
             if !seen.insert(key) {
@@ -581,6 +593,10 @@ fn walk_gfa(
     // When true, dedup (read_id, read_st, starting_node_id) triples across
     // the whole run. See process_path_matches() for details.
     dedup_read_node: bool,
+    // Minimum raw GFA node_id (from parse_gfa). Forwarded to
+    // process_path_matches so the dedup key can store a min_id-relative
+    // node id and survive sparse-ID graphs (e.g. cactus-mc).
+    min_node_id: usize,
     verbose: bool) -> std::io::Result<()>
 {
     if let Some(ref mut file) = gaf_output {
@@ -617,10 +633,20 @@ fn walk_gfa(
     // initial guess: after dedup, count is typically 60-80% of input.
     //
     // Packed u64 key layout (low → high; all 64 bits used):
-    //   bits [ 0..20):  read_id  (max 1,048,575 -- pipeline runs 500K reads)
-    //   bits [20..29):  read_st  (max     511   -- short reads, ≤300 bp)
-    //   bits [29..54):  node_id  (max 33,554,431 -- HPRCv2 chr6 uses ~18M)
-    //   bits [54..64):  offset   (max     1023  -- node lengths capped ≤1024)
+    //   bits [ 0..20):  read_id            (max 1,048,575 -- pipeline runs 500K reads)
+    //   bits [20..29):  read_st            (max     511   -- short reads, ≤300 bp)
+    //   bits [29..54):  node_id - min_id   (max 33,554,431 -- relative; see below)
+    //   bits [54..64):  offset             (max     1023  -- node lengths capped ≤1024)
+    //
+    // The node-id field is stored RELATIVE to min_node_id (the smallest
+    // segment id observed in parse_gfa). Raw GFA ids in some graph builds
+    // (e.g. cactus-mc HPRCv2 chr6: min_id=162,720,608, max_id=171,559,458)
+    // overflow 25 bits even though the actual id range fits in 24. Storing
+    // (id - min_id) keeps the 25-bit field correct for both dense graphs
+    // (min_id ≈ 1, pggb) and sparse-base graphs (min_id ≫ 1, cactus-mc).
+    // The relative-id is identity-preserving on the dedup key: two records
+    // hashing equal still represent the same physical (read_id, read_st,
+    // node, offset) tuple.
     //
     // Why packed: HashSet<u64> is 8 B/slot vs. 16 B for (u32,u32,usize) and
     // hashes a single word. At 60.7M unique keys (HPRCv2 chr6), that's
@@ -697,6 +723,7 @@ fn walk_gfa(
             &mut get_node_len,
             &mut dedup_seen,
             &mut dedup_skipped,
+            min_node_id,
             verbose,
         ) {
             Ok((entries, passes)) => {
@@ -729,6 +756,7 @@ fn walk_gfa(
             &mut get_node_len,
             &mut dedup_seen,
             &mut dedup_skipped,
+            min_node_id,
             verbose,
         ) {
             Ok((entries, passes)) => {
@@ -895,12 +923,19 @@ fn main() {
         // Field-width contract for the packed dedup key (see walk_gfa()).
         // Checked here (not in parse_gfa) because the GAF-input mode doesn't
         // use the packed key and shouldn't be constrained by it.
+        //
+        // The node-id field stores (node_id - min_id), so the constraint is
+        // on the id RANGE (num_segments), not the absolute max id. This lets
+        // graphs with sparse high-base ids (cactus-mc: min_id≈163M) work as
+        // long as the id span fits 25 bits — observed HPRCv2 chr6 span is
+        // 8.84M, well under the 33.5M cap.
         if args.dedup_read_node {
-            let max_node_id = min_id + num_segments - 1;
+            let max_rel_node_id = num_segments - 1;
             let max_node_len = segment_lengths.iter().copied().max().unwrap_or(0);
-            assert!(max_node_id < (1usize << 25),
-                "node_id {} exceeds 25-bit packed dedup field (cap 33,554,431)",
-                max_node_id);
+            assert!(max_rel_node_id < (1usize << 25),
+                "node-id range (num_segments={}) exceeds 25-bit packed \
+                 dedup field (cap 33,554,431). min_id={}, max_id={}.",
+                num_segments, min_id, min_id + num_segments - 1);
             assert!(max_node_len <= 1024,
                 "node length {} exceeds 10-bit packed offset field \
                  (offsets 0..1023 → node length cap 1024)",
@@ -920,7 +955,7 @@ fn main() {
 
         if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
             coverage[node_id - min_id] += len as f64;
-        }, |node_id| segment_lengths[node_id - min_id], args.dedup_read_node, args.verbose) {
+        }, |node_id| segment_lengths[node_id - min_id], args.dedup_read_node, min_id, args.verbose) {
             eprintln!("Error processing GFA file with path positions: {}", e);
             std::process::exit(1);
         }
