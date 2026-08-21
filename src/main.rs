@@ -209,6 +209,7 @@ fn advance_step_cursor(
 
 fn traverse_nodes(
     steps: &[&str],
+    node_ids: &[usize],
     callback: &mut impl FnMut(usize, usize),
     get_node_len: &mut impl FnMut(usize) -> usize,
     start_offset: usize,
@@ -221,25 +222,27 @@ fn traverse_nodes(
         return 0;
     }
 
+    // GAF strand is the XOR of the node's GFA orientation (+/-) and the path
+    // walk direction. is_reverse is constant for this whole call, so only 2
+    // strand values are ever possible here -- precompute both once (stack
+    // values) instead of re-deriving via a match on every step-visit.
+    let (plus_strand, minus_strand) = if is_reverse { ('<', '>') } else { ('>', '<') };
+
     let mut total_path_length = 0;
     let mut remaining_len = match_len;
 
-    for (i, step) in steps.iter().enumerate() {
+    // zip, not enumerate()+index: node_id per step precomputed once per path
+    // by the caller (see process_path_matches) to avoid re-parsing digits on
+    // every step-visit (called once per MEM record touching this step;
+    // ~805M step-visits measured on HPRC chr6). zip's bounds tracking is
+    // inherent to each iterator's own exhaustion, not an extra cross-slice
+    // length check the way index-based access (steps[i], node_ids[i]) is.
+    for (i, (step, &node_id)) in steps.iter().zip(node_ids.iter()).enumerate() {
         let (seg, orient) = step.split_at(step.len() - 1);
-        let node_id = seg.parse::<usize>().unwrap();
         let node_length = get_node_len(node_id);
         total_path_length += node_length;
 
-        // GAF strand is the XOR of the node's GFA orientation (+/-) and the
-        // path walk direction. Using `is_reverse` alone is wrong: a '-' node on
-        // a forward walk must emit '<', and vice versa.
-        let strand = match (orient, is_reverse) {
-            ("+", false) => '>',
-            ("-", false) => '<',
-            ("+", true) => '<',
-            ("-", true) => '>',
-            _ => '>', // default to forward
-        };
+        let strand = if orient == "+" { plus_strand } else { minus_strand };
         path_str.push(strand);
         path_str.push_str(seg);
 
@@ -463,7 +466,19 @@ fn process_path_matches(
         eprintln!("Processing path: {}   seq_id: {}   st: {}   num_matches: {}", name, seq_id, st, num_matches);
     }
 
+    // Pre-parse steps once: node_id + GAF strand char per step, plus cumulative
+    // bp prefix sum. Both node_id and strand are invariant per (path, step,
+    // is_reverse) -- traverse_nodes previously re-derived them (re-parsing the
+    // digits and re-running the strand match) on every one of the ~805M
+    // step-visits measured on HPRC chr6, once per MEM record touching that
+    // step. Precomputing here amortizes the cost to once per path.
     // Pre-parse steps once: node_id per step + cumulative bp prefix sum.
+    // (Strand is NOT precomputed into a parallel array -- an earlier attempt
+    // at that regressed wall time on vesuvio despite removing work, most
+    // likely from the added cross-array bounds-checked indexing outweighing
+    // the eliminated match. is_reverse is constant for the whole call, so
+    // traverse_nodes derives strand from 2 precomputed stack constants and
+    // the orient byte it already has for free, instead of a stored array.)
     let mut step_node_ids: Vec<usize> = Vec::with_capacity(steps.len());
     let mut cum_bp: Vec<usize> = Vec::with_capacity(steps.len() + 1);
     cum_bp.push(0);
@@ -552,7 +567,7 @@ fn process_path_matches(
         }
 
         path_str.clear();
-        let path_len = traverse_nodes(&steps[i..], callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
+        let path_len = traverse_nodes(&steps[i..], &step_node_ids[i..], callback, get_node_len, curr_offset, match_len, is_reverse, &mut path_str);
         let path_start = curr_offset;
         let path_end = curr_offset + match_len;
         if path_len < match_len {
