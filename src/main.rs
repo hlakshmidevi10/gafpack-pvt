@@ -134,7 +134,12 @@ fn parse_gfa(gfa_path: &str) -> std::io::Result<(Vec<usize>, usize)> {
     let path = Path::new(gfa_path);
     let mut reader = create_reader(path)?;
     let mut line = String::new();
-    let mut segments_map = HashMap::new();
+    // min_id isn't known until the full scan completes (segment lines can
+    // arrive in any id order), so the dense array can't be sized/indexed
+    // during the scan itself. Collect into a plain append-only Vec instead
+    // of a HashMap -- no hashing at all (~4.7M inserts on HPRC chr6) -- then
+    // do a second short pass to fill the dense array once min_id is known.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
     let mut min_id = usize::MAX;
     let mut max_id = 0;
 
@@ -166,14 +171,14 @@ fn parse_gfa(gfa_path: &str) -> std::io::Result<(Vec<usize>, usize)> {
         let id = id_str.parse::<usize>().unwrap();
         min_id = min_id.min(id);
         max_id = max_id.max(id);
-        segments_map.insert(id, seq.len());
+        segments.push((id, seq.len()));
     }
 
     // Create a dense vector for O(1) access
     let num_segments = max_id - min_id + 1;
     let mut segment_lengths = vec![0; num_segments];
 
-    for (id, len) in segments_map {
+    for (id, len) in segments {
         segment_lengths[id - min_id] = len;
     }
 
