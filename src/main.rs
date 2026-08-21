@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{prelude::*, BufReader, BufWriter};
 use std::path::Path;
 use std::io::Write;
+use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 
 /// On-disk record in `_path_pos_v2.bin` (written by find_mems v2). Little-endian, 16 bytes.
@@ -623,6 +624,7 @@ fn walk_gfa(
 
     // v2: _path_pos_v2.bin is a contiguous array of 16-byte Records. Cast in
     // place -- bytemuck guarantees alignment + layout via Pod/Zeroable.
+    let records_load_start = Instant::now();
     let bytes = std::fs::read(path_pos_file)?;
     if bytes.len() % std::mem::size_of::<Record>() != 0 {
         return Err(std::io::Error::new(
@@ -634,7 +636,9 @@ fn walk_gfa(
     let records: &[Record] = bytemuck::cast_slice(&bytes);
     eprintln!("Loaded {} path_pos records ({} bytes, {} B/record)",
               records.len(), bytes.len(), std::mem::size_of::<Record>());
+    eprintln!("PHASE_TIMING records_load_s: {:.6}", records_load_start.elapsed().as_secs_f64());
 
+    let path_walk_start = Instant::now();
     let mut line = String::new();
     let mut total_gaf_entries = 0;
     let mut total_passes: u64 = 0;
@@ -793,6 +797,7 @@ fn walk_gfa(
     if let Some(ref mut w) = gaf_output {
         w.flush()?;
     }
+    eprintln!("PHASE_TIMING path_walk_s: {:.6}", path_walk_start.elapsed().as_secs_f64());
     eprintln!("---------------------");
     eprintln!("Total GAF entries: {}", total_gaf_entries);
     eprintln!("Path-scan passes: total={} over {} seq_ids (mean={:.1}, max={}); step-visits≈{}",
@@ -932,7 +937,9 @@ fn main() {
         let path_to_seq_id_map = read_path_name_indices(path_names_file_name, args.verbose).unwrap();
 
         // Parse GFA file
+        let gfa_parse_start = Instant::now();
         let (segment_lengths, min_id) = parse_gfa(&gfa_file).unwrap();
+        eprintln!("PHASE_TIMING gfa_parse_s: {:.6}", gfa_parse_start.elapsed().as_secs_f64());
         let num_segments = segment_lengths.len();       // segment -> node
 
         // Field-width contract for the packed dedup key (see walk_gfa()).
@@ -975,6 +982,7 @@ fn main() {
             std::process::exit(1);
         }
 
+        let coverage_write_start = Instant::now();
         let output_filename = format!("{}_coverage.csv",
                                       args.gaf_file_prefix.as_deref()
                                           .or(args.coverage_prefix.as_deref())
@@ -998,6 +1006,7 @@ fn main() {
             writeln!(output_file, "{},{:.2}", node_id, coverage_value).unwrap();
         }
         output_file.flush().expect("flush coverage output");
+        eprintln!("PHASE_TIMING coverage_write_s: {:.6}", coverage_write_start.elapsed().as_secs_f64());
 
         eprintln!("Coverage data written to: {}", output_filename);
         return;
