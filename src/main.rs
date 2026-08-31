@@ -1272,18 +1272,29 @@ fn merge_bucket(ms: &mut MergeState, coverage: &mut [f64], b: &BucketOut) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk_gfa_parallel(
+/// Fused single-pass parse + walk.
+///
+/// The sequential path reads the GFA twice: parse_gfa scans for S-lines, then
+/// the walker scans again for P-lines. On HPRCv2.1 MC chr1 that is 2 x 26.4 GB,
+/// and the parse leg alone measured ~9.9s of a 44.6s run.
+///
+/// GFA orders records H, S, L, P (verified on both chr1 graphs: S starts at
+/// line 2, L at 11.8M, P at 28.1M), so one pass suffices: accumulate segment
+/// lengths until the first P-line, finalise the dense tables there, then walk.
+/// An S-line after finalisation would mean an incomplete node-length table, so
+/// that aborts loudly rather than silently mis-covering.
+///
+/// Returns (coverage, segment_lengths, min_id) -- the caller needs the latter
+/// two to write the coverage CSV.
+fn parse_and_walk_parallel(
     gfa_path: &str,
     path_pos_file: &str,
     path_to_seq_id_map: &HashMap<String, usize>,
     path_starts: &[usize],
-    coverage: &mut [f64],
-    segment_lengths: &[usize],
     dedup_read_node: bool,
-    min_id: usize,
     threads: usize,
     verbose: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<(Vec<f64>, Vec<usize>, usize)> {
     let records_load_start = Instant::now();
     let bytes = std::fs::read(path_pos_file)?;
     if bytes.len() % std::mem::size_of::<Record>() != 0 {
@@ -1309,6 +1320,16 @@ fn walk_gfa_parallel(
             "read_st {} exceeds 9-bit packed dedup field (cap 511); \
              contract is short reads <=300 bp", max_read_st);
     }
+
+    // S-line accumulation state; finalised at the first P-line.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_min_id = usize::MAX;
+    let mut seg_max_id = 0usize;
+    let mut segment_lengths: Vec<usize> = Vec::new();
+    let mut coverage: Vec<f64> = Vec::new();
+    let mut min_id: usize = 0;
+    let mut finalized = false;
+    let gfa_parse_start = Instant::now();
 
     let mut ms = MergeState {
         dedup_seen: if dedup_read_node {
@@ -1367,11 +1388,54 @@ fn walk_gfa_parallel(
         if !eof {
             lines_scanned += 1;
             // GFA record type is the first byte of the line; no leading
-            // whitespace is permitted by the spec. Non-P lines (S/L/H --
-            // 28.08M of the 28.09M on chr1) are rolled back off the arena.
-            if arena[line_start] != b'P' {
+            // whitespace is permitted by the spec.
+            let rec_type = arena[line_start];
+            if rec_type == b'S' {
+                assert!(!finalized,
+                    "GFA S-line found after the first P-line: the node-length \
+                     table was already finalised, so this segment would be \
+                     missing from coverage. Re-run with --threads 1 for this graph.");
+                let line_b = trim_eol(&arena[line_start..]);
+                let mut fields = line_b.split(|&c| c == b'\t');
+                if let Some((id_b, seq)) = fields.next().and_then(|_t| {
+                    let id_b = fields.next()?;
+                    let seq = fields.next()?;
+                    Some((id_b, seq))
+                }) {
+                    let id = parse_usize_bytes(id_b).expect("non-numeric GFA segment id");
+                    seg_min_id = seg_min_id.min(id);
+                    seg_max_id = seg_max_id.max(id);
+                    segments.push((id, seq.len()));
+                }
                 arena.truncate(line_start);
                 continue;
+            }
+            if rec_type != b'P' {
+                arena.truncate(line_start);
+                continue;
+            }
+            // First P-line: every S-line has been seen, so build dense tables.
+            if !finalized {
+                min_id = if seg_min_id == usize::MAX { 0 } else { seg_min_id };
+                let num_segments = if segments.is_empty() { 0 } else { seg_max_id - min_id + 1 };
+                segment_lengths = vec![0; num_segments];
+                for (id, len) in segments.drain(..) {
+                    segment_lengths[id - min_id] = len;
+                }
+                if dedup_read_node {
+                    let max_rel_node_id = num_segments.saturating_sub(1);
+                    let max_node_len = segment_lengths.iter().copied().max().unwrap_or(0);
+                    assert!(max_rel_node_id < (1usize << 25),
+                        "node-id range (num_segments={}) exceeds 25-bit packed dedup \
+                         field (cap 33,554,431). min_id={}", num_segments, min_id);
+                    assert!(max_node_len <= 1024,
+                        "node length {} exceeds 10-bit packed offset field \
+                         (offsets 0..1023 -> node length cap 1024)", max_node_len);
+                }
+                coverage = vec![0.0; num_segments];
+                eprintln!("PHASE_TIMING gfa_parse_s: {:.6}   (fused into the walk pass)",
+                          gfa_parse_start.elapsed().as_secs_f64());
+                finalized = true;
             }
             spans.push((line_start, arena.len()));
             p_lines += 1;
@@ -1383,7 +1447,7 @@ fn walk_gfa_parallel(
                 spans.par_iter()
                     .flat_map_iter(|&(a, b)| buckets_for_pline(
                         &arena_ref[a..b], path_to_seq_id_map, path_starts, records,
-                        segment_lengths, min_id, dedup_read_node))
+                        &segment_lengths, min_id, dedup_read_node))
                     .collect()
             });
             dispatch_secs += dispatch_start.elapsed().as_secs_f64();
@@ -1392,7 +1456,7 @@ fn walk_gfa_parallel(
                 if verbose {
                     eprintln!("PASSES\t{}\t{}\t{}\t{}", b.seq_id, b.n_steps, b.recs.len(), 1);
                 }
-                merge_bucket(&mut ms, coverage, b);
+                merge_bucket(&mut ms, &mut coverage, b);
             }
             merge_secs += merge_start.elapsed().as_secs_f64();
             spans.clear();
@@ -1429,7 +1493,17 @@ fn walk_gfa_parallel(
                       seen.len(), kept);
         }
     }
-    Ok(())
+    if !finalized {
+        // GFA with no P-lines at all: still hand back a consistent table.
+        min_id = if seg_min_id == usize::MAX { 0 } else { seg_min_id };
+        let num_segments = if segments.is_empty() { 0 } else { seg_max_id - min_id + 1 };
+        segment_lengths = vec![0; num_segments];
+        for (id, len) in segments.drain(..) {
+            segment_lengths[id - min_id] = len;
+        }
+        coverage = vec![0.0; num_segments];
+    }
+    Ok((coverage, segment_lengths, min_id))
 }
 
 fn main() {
@@ -1448,36 +1522,6 @@ fn main() {
         let seq_starts = read_cumulative_starts(seq_id_starts_file).unwrap();
         let path_to_seq_id_map = read_path_name_indices(path_names_file_name, args.verbose).unwrap();
 
-        // Parse GFA file
-        let gfa_parse_start = Instant::now();
-        let (segment_lengths, min_id) = parse_gfa(&gfa_file).unwrap();
-        eprintln!("PHASE_TIMING gfa_parse_s: {:.6}", gfa_parse_start.elapsed().as_secs_f64());
-        let num_segments = segment_lengths.len();       // segment -> node
-
-        // Field-width contract for the packed dedup key (see walk_gfa()).
-        // Checked here (not in parse_gfa) because the GAF-input mode doesn't
-        // use the packed key and shouldn't be constrained by it.
-        //
-        // The node-id field stores (node_id - min_id), so the constraint is
-        // on the id RANGE (num_segments), not the absolute max id. This lets
-        // graphs with sparse high-base ids (cactus-mc: min_id≈163M) work as
-        // long as the id span fits 25 bits — observed HPRCv2 chr6 span is
-        // 8.84M, well under the 33.5M cap.
-        if args.dedup_read_node {
-            let max_rel_node_id = num_segments - 1;
-            let max_node_len = segment_lengths.iter().copied().max().unwrap_or(0);
-            assert!(max_rel_node_id < (1usize << 25),
-                "node-id range (num_segments={}) exceeds 25-bit packed \
-                 dedup field (cap 33,554,431). min_id={}, max_id={}.",
-                num_segments, min_id, min_id + num_segments - 1);
-            assert!(max_node_len <= 1024,
-                "node length {} exceeds 10-bit packed offset field \
-                 (offsets 0..1023 → node length cap 1024)",
-                max_node_len);
-        }
-
-        let mut coverage: Vec<f64> = vec![0.0; num_segments];
-
         // Create output file if file_prefix is provided
         let gaf_output = if let Some(prefix) = &args.gaf_file_prefix {
             let gaf_filename = format!("{}.gaf", prefix);
@@ -1487,27 +1531,61 @@ fn main() {
             None
         };
 
-        // Parallel walker handles the production path (coverage-only). --gaf
-        // stays on the sequential walker: it is a one-time validation artifact
-        // and keeping GAF line order identical there is worth more than the
-        // speedup. --threads 1 also routes to the sequential walker, giving a
-        // trivial A/B for correctness checks.
+        // Parallel walker handles the production path (coverage-only), and
+        // fuses the S-line parse into the same GFA pass. --gaf stays on the
+        // two-pass sequential walker: it is a one-time validation artifact and
+        // keeping GAF line order identical there is worth more than the
+        // speedup. --threads 1 also routes to sequential, giving a trivial A/B.
         let use_parallel = args.threads > 1 && gaf_output.is_none();
-        if use_parallel {
-            if let Err(e) = walk_gfa_parallel(
+
+        let (coverage, segment_lengths, min_id) = if use_parallel {
+            match parse_and_walk_parallel(
                 &gfa_file, path_pos_file, &path_to_seq_id_map, &seq_starts,
-                &mut coverage, &segment_lengths, args.dedup_read_node, min_id,
-                args.threads, args.verbose)
+                args.dedup_read_node, args.threads, args.verbose)
             {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error processing GFA file with path positions: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // Two-pass: parse_gfa scans for S-lines, walk_gfa rescans for P.
+            let gfa_parse_start = Instant::now();
+            let (segment_lengths, min_id) = parse_gfa(&gfa_file).unwrap();
+            eprintln!("PHASE_TIMING gfa_parse_s: {:.6}", gfa_parse_start.elapsed().as_secs_f64());
+            let num_segments = segment_lengths.len();
+
+            // Field-width contract for the packed dedup key (see walk_gfa()).
+            // Checked here (not in parse_gfa) because the GAF-input mode
+            // doesn't use the packed key and shouldn't be constrained by it.
+            //
+            // The node-id field stores (node_id - min_id), so the constraint
+            // is on the id RANGE (num_segments), not the absolute max id.
+            // This lets graphs with sparse high-base ids (cactus-mc:
+            // min_id≈163M) work as long as the id span fits 25 bits.
+            if args.dedup_read_node {
+                let max_rel_node_id = num_segments - 1;
+                let max_node_len = segment_lengths.iter().copied().max().unwrap_or(0);
+                assert!(max_rel_node_id < (1usize << 25),
+                    "node-id range (num_segments={}) exceeds 25-bit packed \
+                     dedup field (cap 33,554,431). min_id={}, max_id={}.",
+                    num_segments, min_id, min_id + num_segments - 1);
+                assert!(max_node_len <= 1024,
+                    "node length {} exceeds 10-bit packed offset field \
+                     (offsets 0..1023 → node length cap 1024)",
+                    max_node_len);
+            }
+
+            let mut coverage: Vec<f64> = vec![0.0; num_segments];
+            if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
+                coverage[node_id - min_id] += len as f64;
+            }, |node_id| segment_lengths[node_id - min_id], args.dedup_read_node, min_id, args.verbose) {
                 eprintln!("Error processing GFA file with path positions: {}", e);
                 std::process::exit(1);
             }
-        } else if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
-            coverage[node_id - min_id] += len as f64;
-        }, |node_id| segment_lengths[node_id - min_id], args.dedup_read_node, min_id, args.verbose) {
-            eprintln!("Error processing GFA file with path positions: {}", e);
-            std::process::exit(1);
-        }
+            (coverage, segment_lengths, min_id)
+        };
 
         let coverage_write_start = Instant::now();
         let output_filename = format!("{}_coverage.csv",
