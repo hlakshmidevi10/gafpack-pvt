@@ -1338,8 +1338,15 @@ fn walk_gfa_parallel(
     // Raw bytes, not read_line-into-String: the walk phase rescans the whole
     // GFA (28.08M lines / 26.4 GB on chr1) and only 4,817 of those lines are
     // P-lines. read_line would UTF-8-validate every byte on the serial path.
-    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
-    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
+    //
+    // P-lines are read DIRECTLY into a per-batch arena rather than into a
+    // scratch buffer that is then cloned into the batch. read_until appends,
+    // so we can speculatively read every line at the arena's tail and simply
+    // truncate back when it turns out not to be a P-line. That removes an
+    // entire copy of the ~25 GB of P-line payload per run; the earlier
+    // scratch+clone shape paid for it twice.
+    let mut arena: Vec<u8> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
     // Serial-phase accounting: merge_secs is the ordered-merge cost (the price
     // of determinism); read_secs is the single-threaded GFA line scan.
     // Serial-phase accounting. Measured by subtraction rather than per-line
@@ -1354,29 +1361,28 @@ fn walk_gfa_parallel(
     let mut p_lines: u64 = 0;
 
     loop {
-        buf.clear();
-        let bytes_read = reader.read_until(b'\n', &mut buf)?;
+        let line_start = arena.len();
+        let bytes_read = reader.read_until(b'\n', &mut arena)?;
         let eof = bytes_read == 0;
         if !eof {
             lines_scanned += 1;
             // GFA record type is the first byte of the line; no leading
-            // whitespace is permitted by the spec.
-            if buf.first() != Some(&b'P') {
+            // whitespace is permitted by the spec. Non-P lines (S/L/H --
+            // 28.08M of the 28.09M on chr1) are rolled back off the arena.
+            if arena[line_start] != b'P' {
+                arena.truncate(line_start);
                 continue;
             }
-            // NOT mem::take: that would hand `buf`'s allocation to the batch
-            // and leave `buf` empty, so every subsequent P-line regrows from
-            // zero capacity. Cloning is one exact-size alloc plus one copy,
-            // and `buf` retains its capacity for the next read.
-            batch.push(buf.clone());
+            spans.push((line_start, arena.len()));
             p_lines += 1;
         }
-        if batch.len() >= batch_size || (eof && !batch.is_empty()) {
+        if spans.len() >= batch_size || (eof && !spans.is_empty()) {
             let dispatch_start = Instant::now();
+            let arena_ref: &[u8] = &arena;
             let outs: Vec<BucketOut> = pool.install(|| {
-                batch.par_iter()
-                    .flat_map_iter(|l| buckets_for_pline(
-                        l, path_to_seq_id_map, path_starts, records,
+                spans.par_iter()
+                    .flat_map_iter(|&(a, b)| buckets_for_pline(
+                        &arena_ref[a..b], path_to_seq_id_map, path_starts, records,
                         segment_lengths, min_id, dedup_read_node))
                     .collect()
             });
@@ -1389,7 +1395,8 @@ fn walk_gfa_parallel(
                 merge_bucket(&mut ms, coverage, b);
             }
             merge_secs += merge_start.elapsed().as_secs_f64();
-            batch.clear();
+            spans.clear();
+            arena.clear();
         }
         if eof {
             break;
