@@ -1292,8 +1292,13 @@ fn walk_gfa_parallel(
     let mut reader = create_reader(path)?;
     let mut line = String::new();
     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+    // Serial-phase accounting: merge_secs is the ordered-merge cost (the price
+    // of determinism); read_secs is the single-threaded GFA line scan.
+    let mut merge_secs = 0.0f64;
+    let mut read_secs = 0.0f64;
 
     loop {
+        let read_start = Instant::now();
         line.clear();
         let bytes_read = reader.read_line(&mut line)?;
         let eof = bytes_read == 0;
@@ -1303,6 +1308,7 @@ fn walk_gfa_parallel(
             }
             batch.push(std::mem::take(&mut line));
         }
+        read_secs += read_start.elapsed().as_secs_f64();
         if batch.len() >= batch_size || (eof && !batch.is_empty()) {
             let outs: Vec<BucketOut> = pool.install(|| {
                 batch.par_iter()
@@ -1311,12 +1317,14 @@ fn walk_gfa_parallel(
                         segment_lengths, min_id, dedup_read_node))
                     .collect()
             });
+            let merge_start = Instant::now();
             for b in &outs {
                 if verbose {
                     eprintln!("PASSES\t{}\t{}\t{}\t{}", b.seq_id, b.n_steps, b.recs.len(), 1);
                 }
                 merge_bucket(&mut ms, coverage, b);
             }
+            merge_secs += merge_start.elapsed().as_secs_f64();
             batch.clear();
         }
         if eof {
@@ -1325,6 +1333,8 @@ fn walk_gfa_parallel(
     }
 
     eprintln!("PHASE_TIMING path_walk_s: {:.6}", path_walk_start.elapsed().as_secs_f64());
+    eprintln!("PHASE_TIMING   walk_merge_s: {:.6}   (ordered merge = cost of determinism)", merge_secs);
+    eprintln!("PHASE_TIMING   walk_read_s: {:.6}   (single-threaded GFA line scan)", read_secs);
     eprintln!("---------------------");
     eprintln!("Total GAF entries: {}", ms.total_gaf_entries);
     eprintln!("Path-scan passes: total={} over {} seq_ids (mean={:.1}, max={}); step-visits≈{}",
