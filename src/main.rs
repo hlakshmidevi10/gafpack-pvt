@@ -1299,27 +1299,35 @@ fn walk_gfa_parallel(
     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
     // Serial-phase accounting: merge_secs is the ordered-merge cost (the price
     // of determinism); read_secs is the single-threaded GFA line scan.
+    // Serial-phase accounting. Measured by subtraction rather than per-line
+    // Instant::now() calls: the scan touches ~28M lines on chr1, so two clock
+    // reads per line would be ~1s of pure instrumentation. read_secs therefore
+    // covers ALL line reading -- including the S/L lines that are scanned and
+    // discarded, which an earlier version of this counter silently omitted by
+    // accumulating after the `continue`.
     let mut merge_secs = 0.0f64;
-    let mut read_secs = 0.0f64;
+    let mut dispatch_secs = 0.0f64;
+    let mut lines_scanned: u64 = 0;
+    let mut p_lines: u64 = 0;
 
     loop {
-        let read_start = Instant::now();
         line.clear();
         let bytes_read = reader.read_line(&mut line)?;
         let eof = bytes_read == 0;
         if !eof {
+            lines_scanned += 1;
             if !line.trim_start().starts_with('P') {
                 continue;
             }
             // NOT mem::take: that hands `line`'s buffer to the batch and
             // leaves `line` empty, so every subsequent P-line regrows from
-            // zero capacity (P-lines average 5.5 MB on HPRC chr1 -- a full
-            // doubling-realloc chain each). Cloning is one exact-size alloc
-            // plus one copy, and `line` retains its capacity for the next read.
+            // zero capacity. Cloning is one exact-size alloc plus one copy,
+            // and `line` retains its capacity for the next read.
             batch.push(line.clone());
+            p_lines += 1;
         }
-        read_secs += read_start.elapsed().as_secs_f64();
         if batch.len() >= batch_size || (eof && !batch.is_empty()) {
+            let dispatch_start = Instant::now();
             let outs: Vec<BucketOut> = pool.install(|| {
                 batch.par_iter()
                     .flat_map_iter(|l| buckets_for_pline(
@@ -1327,6 +1335,7 @@ fn walk_gfa_parallel(
                         segment_lengths, min_id, dedup_read_node))
                     .collect()
             });
+            dispatch_secs += dispatch_start.elapsed().as_secs_f64();
             let merge_start = Instant::now();
             for b in &outs {
                 if verbose {
@@ -1343,8 +1352,11 @@ fn walk_gfa_parallel(
     }
 
     eprintln!("PHASE_TIMING path_walk_s: {:.6}", path_walk_start.elapsed().as_secs_f64());
+    let walk_total = path_walk_start.elapsed().as_secs_f64();
+    eprintln!("PHASE_TIMING   walk_dispatch_s: {:.6}   (parallel per-bucket work)", dispatch_secs);
     eprintln!("PHASE_TIMING   walk_merge_s: {:.6}   (ordered merge = cost of determinism)", merge_secs);
-    eprintln!("PHASE_TIMING   walk_read_s: {:.6}   (single-threaded GFA line scan)", read_secs);
+    eprintln!("PHASE_TIMING   walk_read_s: {:.6}   (single-threaded GFA line scan, {} lines, {} of them P)",
+              (walk_total - dispatch_secs - merge_secs).max(0.0), lines_scanned, p_lines);
     eprintln!("---------------------");
     eprintln!("Total GAF entries: {}", ms.total_gaf_entries);
     eprintln!("Path-scan passes: total={} over {} seq_ids (mean={:.1}, max={}); step-visits≈{}",
