@@ -8,6 +8,7 @@ use std::path::Path;
 use std::io::Write;
 use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
+use rayon::prelude::*;
 
 /// On-disk record in `_path_pos_v2.bin` (written by find_mems v2). Little-endian, 16 bytes.
 ///
@@ -923,6 +924,428 @@ struct Args {
     /// (33M nodes), offset < 2^10 (node length ≤1024 bp). Violations abort.
     #[arg(long)]
     dedup_read_node: bool,
+    /// Worker threads for the path-walk phase (coverage-only mode).
+    /// 1 = the original single-threaded walker. Output is byte-identical at
+    /// any thread count: workers only compute coverage contributions, and a
+    /// single-threaded merge applies them in GFA/bucket order, so dedup
+    /// winners never depend on scheduling. --gaf falls back to the
+    /// sequential walker regardless of this setting.
+    #[arg(long, default_value_t = 8)]
+    threads: usize,
+}
+
+// ============================================================================
+// Parallel walker (coverage + dedup path)
+// ============================================================================
+//
+// Why: PHASE_TIMING shows path_walk_s is ~93% of gafpack wall on HPRCv2-scale
+// graphs (chr1: 177 s of 190 s). The dominant term inside it is the per-bucket
+// rebuild of step_node_ids/cum_bp in process_path_matches -- ~5.97e9
+// step-visits on chr1, and essentially INDEPENDENT of record count (mc-chr6
+// shows 4,530,711,133 vs 4,530,698,953 step-visits for 1.74M vs 5.03M
+// records). That work is per-path and embarrassingly parallel.
+//
+// Design: workers do the expensive per-bucket scan and return the coverage
+// CONTRIBUTIONS they would have made; a single-threaded merge applies them in
+// bucket order. The merge costs one hash op plus a few adds per record (~1-2 s
+// against a 177 s scan), and buys three things:
+//   * determinism -- output does not depend on thread scheduling, so coverage
+//     MD5 remains a usable correctness gate;
+//   * byte-identity with the sequential walker -- the merge visits buckets in
+//     GFA order and records in index order, so dedup winners are the same
+//     records the sequential walker would have kept. This matters because
+//     ~1.05% of dedup keys on PGGB graphs have >=2 DISTINCT downstream walks
+//     (measured), so a different winner yields different per-node coverage;
+//   * no float-order question -- coverage accumulation stays single-threaded.
+//
+// Semantics preserved from process_path_matches (do not "simplify" these):
+//   * the dedup insert happens BEFORE traversal, so a record that later fails
+//     the path_len sanity checks still consumes its key;
+//   * coverage IS applied for records that fail those checks -- traverse runs
+//     first and the `continue` only skips the GAF-entry count;
+//   * the path_len ERROR messages are emitted only for records that actually
+//     reach traversal, i.e. dedup winners. Workers therefore record the error
+//     condition and the merge decides whether to print it.
+//
+// --gaf is deliberately NOT supported here and falls back to the sequential
+// walker: GAF output is a one-time validation artifact, while query.sh's
+// production path is --coverage-prefix.
+
+/// Per-record result from a worker. Coverage contributions live in the
+/// bucket's flat `contribs` arena; this holds the range plus what the merge
+/// needs to reproduce sequential stderr/counters.
+#[derive(Clone, Copy)]
+struct RecOut {
+    key: u64,
+    contrib_start: u32,
+    contrib_len: u32,
+    /// 0 = ok, 1 = path_len < match_len, 2 = path_len < path_end
+    err: u8,
+    path_len: u32,
+    path_end: u32,
+    match_len: u32,
+}
+
+/// One (path, orientation) bucket's worth of work, computed off-thread.
+struct BucketOut {
+    name: String,
+    seq_id: usize,
+    recs: Vec<RecOut>,
+    /// (node_id - min_id, coverage_bp) pairs, indexed by RecOut ranges.
+    contribs: Vec<(u32, u32)>,
+    oob: u64,
+    oob_msgs: Vec<String>,
+    num_matches: usize,
+    n_steps: usize,
+}
+
+/// traverse_nodes without the GAF path_str construction: pushes (node, bp)
+/// contributions instead of invoking a callback. Iteration bound matches the
+/// original's steps.zip(node_ids) -- both slices are the same length here.
+fn traverse_collect(
+    node_ids: &[usize],
+    segment_lengths: &[usize],
+    min_id: usize,
+    start_offset: usize,
+    match_len: usize,
+    out: &mut Vec<(u32, u32)>,
+) -> usize {
+    if node_ids.is_empty() || match_len == 0 {
+        return 0;
+    }
+    let mut total_path_length = 0usize;
+    let mut remaining_len = match_len;
+    for (i, &node_id) in node_ids.iter().enumerate() {
+        let node_length = segment_lengths[node_id - min_id];
+        total_path_length += node_length;
+        let coverage = if i == 0 {
+            min(remaining_len, node_length - start_offset)
+        } else {
+            min(remaining_len, node_length)
+        };
+        remaining_len -= coverage;
+        out.push(((node_id - min_id) as u32, coverage as u32));
+        if remaining_len == 0 {
+            break;
+        }
+    }
+    total_path_length
+}
+
+/// Pure per-bucket worker. No shared state, no I/O, no stderr.
+#[allow(clippy::too_many_arguments)]
+fn process_bucket(
+    steps: &[&str],
+    seq_id: usize,
+    name: &str,
+    path_starts: &[usize],
+    records: &[Record],
+    segment_lengths: &[usize],
+    min_id: usize,
+    dedup: bool,
+) -> BucketOut {
+    let st = path_starts[seq_id];
+    let end = path_starts[seq_id + 1];
+    let num_matches = end - st;
+
+    let mut out = BucketOut {
+        name: name.to_string(),
+        seq_id,
+        recs: Vec::new(),
+        contribs: Vec::new(),
+        oob: 0,
+        oob_msgs: Vec::new(),
+        num_matches,
+        n_steps: steps.len(),
+    };
+    if num_matches == 0 {
+        return out;
+    }
+
+    // The expensive part: one linear pass over every step of the path.
+    let mut step_node_ids: Vec<usize> = Vec::with_capacity(steps.len());
+    let mut cum_bp: Vec<usize> = Vec::with_capacity(steps.len() + 1);
+    cum_bp.push(0);
+    for step in steps.iter() {
+        let (seg, _orient) = step.split_at(step.len() - 1);
+        let seg_id = seg.parse::<usize>().unwrap();
+        step_node_ids.push(seg_id);
+        cum_bp.push(cum_bp.last().unwrap() + segment_lengths[seg_id - min_id]);
+    }
+    let path_total_bp = *cum_bp.last().unwrap();
+
+    out.recs.reserve(num_matches);
+    let mut i: usize = 0;
+    let mut cum: usize = 0;
+
+    for idx in st..end {
+        let r = &records[idx];
+        let path_bp = r.path_bp as usize;
+        let match_len = r.match_len as usize;
+
+        if path_bp >= path_total_bp {
+            out.oob += 1;
+            if out.oob <= 5 {
+                out.oob_msgs.push(format!(
+                    "ERROR: path_bp {} >= path length {} on path {} (seq_id {}); skipping record idx {}",
+                    path_bp, path_total_bp, name, seq_id, idx));
+            }
+            continue;
+        }
+
+        advance_step_cursor(path_bp, &cum_bp, &mut i, &mut cum);
+        debug_assert!(cum_bp[i] <= path_bp);
+        debug_assert!(path_bp < cum_bp[i + 1]);
+        let curr_offset = path_bp - cum;
+
+        // Same packed layout as the sequential walker; see walk_gfa().
+        let key = if dedup {
+            let rel_node_id = step_node_ids[i] - min_id;
+            (r.read_id as u64)
+                | ((r.read_st as u64) << 20)
+                | ((rel_node_id as u64) << 29)
+                | ((curr_offset as u64) << 54)
+        } else {
+            0
+        };
+
+        let contrib_start = out.contribs.len() as u32;
+        let path_len = traverse_collect(
+            &step_node_ids[i..], segment_lengths, min_id,
+            curr_offset, match_len, &mut out.contribs);
+        let contrib_len = out.contribs.len() as u32 - contrib_start;
+        let path_end = curr_offset + match_len;
+        let err = if path_len < match_len { 1 } else if path_len < path_end { 2 } else { 0 };
+
+        out.recs.push(RecOut {
+            key, contrib_start, contrib_len, err,
+            path_len: path_len as u32, path_end: path_end as u32,
+            match_len: match_len as u32,
+        });
+    }
+    out
+}
+
+/// Parse one GFA P-line into its two (forward, reverse) buckets. Returns an
+/// empty vec for unparseable or unmapped paths, matching walk_gfa's behaviour
+/// of warning and continuing.
+fn buckets_for_pline(
+    line_str: &str,
+    path_to_seq_id_map: &HashMap<String, usize>,
+    path_starts: &[usize],
+    records: &[Record],
+    segment_lengths: &[usize],
+    min_id: usize,
+    dedup: bool,
+) -> Vec<BucketOut> {
+    let line_str = line_str.trim();
+    let mut fields = line_str.split('\t');
+    let Some((name, steps_str)) = fields.next().and_then(|_type| {
+        let name = fields.next()?;
+        let steps = fields.next()?;
+        Some((name, steps))
+    }) else {
+        eprintln!("Unable to parse GFA path: {}\n", line_str);
+        return Vec::new();
+    };
+    let Some(&path_idx) = path_to_seq_id_map.get(name) else {
+        eprintln!("Skipping path: {} not found\n", name);
+        return Vec::new();
+    };
+
+    let positive_strand_seq_id = path_idx * 2;
+    let steps: Vec<&str> = steps_str.split(',').collect();
+    let fwd = process_bucket(&steps, positive_strand_seq_id, name,
+                             path_starts, records, segment_lengths, min_id, dedup);
+    let reverse_steps: Vec<&str> = steps.iter().rev().copied().collect();
+    let rev_name = format!("{}_reverse", name);
+    let rev = process_bucket(&reverse_steps, positive_strand_seq_id + 1, &rev_name,
+                             path_starts, records, segment_lengths, min_id, dedup);
+    vec![fwd, rev]
+}
+
+/// Running state for the sequential merge.
+struct MergeState {
+    dedup_seen: Option<HashSet<u64>>,
+    dedup_skipped: u64,
+    total_gaf_entries: usize,
+    total_passes: u64,
+    max_passes: u64,
+    total_step_visits: u64,
+    nonempty_seq_ids: u64,
+}
+
+/// Apply one bucket's contributions. Visiting buckets in GFA order and
+/// records in index order reproduces the sequential walker's dedup winners
+/// exactly -- see the module comment above for why that matters.
+fn merge_bucket(ms: &mut MergeState, coverage: &mut [f64], b: &BucketOut) {
+    for m in &b.oob_msgs {
+        eprintln!("{}", m);
+    }
+    if b.num_matches == 0 {
+        return;
+    }
+    ms.nonempty_seq_ids += 1;
+    ms.total_passes += 1;
+    ms.max_passes = ms.max_passes.max(1);
+    ms.total_step_visits += b.n_steps as u64;
+
+    for rec in &b.recs {
+        if let Some(seen) = ms.dedup_seen.as_mut() {
+            if !seen.insert(rec.key) {
+                ms.dedup_skipped += 1;
+                continue;
+            }
+        }
+        // Coverage is applied BEFORE the path_len checks, matching the
+        // sequential walker (traverse_nodes runs first there too).
+        let s = rec.contrib_start as usize;
+        let e = s + rec.contrib_len as usize;
+        for &(node, cov) in &b.contribs[s..e] {
+            coverage[node as usize] += cov as f64;
+        }
+        match rec.err {
+            1 => {
+                eprintln!("ERROR Path len {} << match_len {}. Path name: {} (path_str omitted in parallel mode)",
+                          rec.path_len, rec.match_len, b.name);
+                continue;
+            }
+            2 => {
+                eprintln!("ERROR: Path len {} <= path_end {}. Path name: {} (path_str omitted in parallel mode)",
+                          rec.path_len, rec.path_end, b.name);
+                continue;
+            }
+            _ => {}
+        }
+        ms.total_gaf_entries += 1;
+    }
+
+    if b.oob > 0 {
+        eprintln!("path {}: {} path_bp-out-of-range (of {} records)",
+                  b.name, b.oob, b.num_matches);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_gfa_parallel(
+    gfa_path: &str,
+    path_pos_file: &str,
+    path_to_seq_id_map: &HashMap<String, usize>,
+    path_starts: &[usize],
+    coverage: &mut [f64],
+    segment_lengths: &[usize],
+    dedup_read_node: bool,
+    min_id: usize,
+    threads: usize,
+    verbose: bool,
+) -> std::io::Result<()> {
+    let records_load_start = Instant::now();
+    let bytes = std::fs::read(path_pos_file)?;
+    if bytes.len() % std::mem::size_of::<Record>() != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("path_pos file size {} is not a multiple of {} (Record size). \
+                     Expected v2 format (_path_pos_v2.bin). Is this a v1 file?",
+                    bytes.len(), std::mem::size_of::<Record>())));
+    }
+    let records: &[Record] = bytemuck::cast_slice(&bytes);
+    eprintln!("Loaded {} path_pos records ({} bytes, {} B/record)",
+              records.len(), bytes.len(), std::mem::size_of::<Record>());
+    eprintln!("PHASE_TIMING records_load_s: {:.6}", records_load_start.elapsed().as_secs_f64());
+
+    // Identical field-width contract to the sequential walker.
+    if dedup_read_node {
+        let max_read_id = records.iter().map(|r| r.read_id).max().unwrap_or(0);
+        let max_read_st = records.iter().map(|r| r.read_st).max().unwrap_or(0);
+        assert!(max_read_id < (1u32 << 20),
+            "read_id {} exceeds 20-bit packed dedup field (cap 1,048,575); \
+             pipeline contract is 500K reads/run", max_read_id);
+        assert!(max_read_st < (1u32 << 9),
+            "read_st {} exceeds 9-bit packed dedup field (cap 511); \
+             contract is short reads <=300 bp", max_read_st);
+    }
+
+    let mut ms = MergeState {
+        dedup_seen: if dedup_read_node {
+            eprintln!("Dedup mode: (read_id, read_st, starting_node_id, offset) — enabled");
+            Some(HashSet::with_capacity(records.len() / 2 + 16))
+        } else { None },
+        dedup_skipped: 0,
+        total_gaf_entries: 0,
+        total_passes: 0,
+        max_passes: 0,
+        total_step_visits: 0,
+        nonempty_seq_ids: 0,
+    };
+
+    let path_walk_start = Instant::now();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("failed to build rayon thread pool");
+    // Batch is deliberately small: peak memory is one batch of step arrays
+    // (~12 MB per HPRC chr1 bucket) plus its contributions, not the whole GFA.
+    let batch_size = (threads * 2).max(2);
+    eprintln!("Parallel walker: {} threads, batch {} P-lines", threads, batch_size);
+
+    let path = Path::new(gfa_path);
+    let mut reader = create_reader(path)?;
+    let mut line = String::new();
+    let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        let eof = bytes_read == 0;
+        if !eof {
+            if !line.trim_start().starts_with('P') {
+                continue;
+            }
+            batch.push(std::mem::take(&mut line));
+        }
+        if batch.len() >= batch_size || (eof && !batch.is_empty()) {
+            let outs: Vec<BucketOut> = pool.install(|| {
+                batch.par_iter()
+                    .flat_map_iter(|l| buckets_for_pline(
+                        l, path_to_seq_id_map, path_starts, records,
+                        segment_lengths, min_id, dedup_read_node))
+                    .collect()
+            });
+            for b in &outs {
+                if verbose {
+                    eprintln!("PASSES\t{}\t{}\t{}\t{}", b.seq_id, b.n_steps, b.recs.len(), 1);
+                }
+                merge_bucket(&mut ms, coverage, b);
+            }
+            batch.clear();
+        }
+        if eof {
+            break;
+        }
+    }
+
+    eprintln!("PHASE_TIMING path_walk_s: {:.6}", path_walk_start.elapsed().as_secs_f64());
+    eprintln!("---------------------");
+    eprintln!("Total GAF entries: {}", ms.total_gaf_entries);
+    eprintln!("Path-scan passes: total={} over {} seq_ids (mean={:.1}, max={}); step-visits≈{}",
+              ms.total_passes, ms.nonempty_seq_ids,
+              ms.total_passes as f64 / ms.nonempty_seq_ids.max(1) as f64,
+              ms.max_passes, ms.total_step_visits);
+    if let Some(seen) = ms.dedup_seen.as_ref() {
+        let total_records = records.len();
+        let kept = total_records as i64 - ms.dedup_skipped as i64;
+        eprintln!("Dedup: {} unique (read_id, read_st, starting_node_id, offset) keys; \
+                   {} duplicates skipped ({:.2}% of {} records)",
+                  seen.len(), ms.dedup_skipped,
+                  100.0 * ms.dedup_skipped as f64 / total_records as f64,
+                  total_records);
+        if seen.len() as i64 != kept {
+            eprintln!("WARN: dedup set size ({}) != kept records ({}); \
+                       this should not happen — please report",
+                      seen.len(), kept);
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -980,7 +1403,22 @@ fn main() {
             None
         };
 
-        if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
+        // Parallel walker handles the production path (coverage-only). --gaf
+        // stays on the sequential walker: it is a one-time validation artifact
+        // and keeping GAF line order identical there is worth more than the
+        // speedup. --threads 1 also routes to the sequential walker, giving a
+        // trivial A/B for correctness checks.
+        let use_parallel = args.threads > 1 && gaf_output.is_none();
+        if use_parallel {
+            if let Err(e) = walk_gfa_parallel(
+                &gfa_file, path_pos_file, &path_to_seq_id_map, &seq_starts,
+                &mut coverage, &segment_lengths, args.dedup_read_node, min_id,
+                args.threads, args.verbose)
+            {
+                eprintln!("Error processing GFA file with path positions: {}", e);
+                std::process::exit(1);
+            }
+        } else if let Err(e) = walk_gfa(&gfa_file, path_pos_file, path_to_seq_id_map, seq_starts, gaf_output, |node_id, len| {
             coverage[node_id - min_id] += len as f64;
         }, |node_id| segment_lengths[node_id - min_id], args.dedup_read_node, min_id, args.verbose) {
             eprintln!("Error processing GFA file with path positions: {}", e);

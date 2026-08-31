@@ -11,3 +11,4 @@ clap = { version = "4.5.40", features = ["derive"] }
 niffler = "2.6.0"
 flate2 = "1.1.2"
 bytemuck = { version = "1", features = ["derive"] }
+rayon = "1.10"
