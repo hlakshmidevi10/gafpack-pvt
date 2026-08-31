@@ -134,12 +134,44 @@ fn create_reader(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
     }
 }
 
+
+/// Strip a trailing CR/LF from a raw line.
+#[inline]
+fn trim_eol(b: &[u8]) -> &[u8] {
+    let mut e = b.len();
+    while e > 0 && (b[e - 1] == b'\n' || b[e - 1] == b'\r') {
+        e -= 1;
+    }
+    &b[..e]
+}
+
+/// ASCII-decimal parse straight off bytes, so the GFA scan never has to
+/// materialise a &str. Returns None on empty input or any non-digit.
+#[inline]
+fn parse_usize_bytes(b: &[u8]) -> Option<usize> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v: usize = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+    }
+    Some(v)
+}
+
 /// Parse GFA file and extract segment information
 /// Returns (segment_lengths, min_id) where segment_lengths[id - min_id] gives the length
 fn parse_gfa(gfa_path: &str) -> std::io::Result<(Vec<usize>, usize)> {
     let path = Path::new(gfa_path);
     let mut reader = create_reader(path)?;
-    let mut line = String::new();
+    // Read raw bytes rather than read_line-into-String: the GFA reaches
+    // 26.4 GB on HPRCv2.1 MC chr1 and read_line UTF-8-validates every byte of
+    // it. Nothing here needs a &str -- ids and sequence lengths come straight
+    // off the bytes.
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
     // min_id isn't known until the full scan completes (segment lines can
     // arrive in any id order), so the dense array can't be sized/indexed
     // during the scan itself. Collect into a plain append-only Vec instead
@@ -150,31 +182,31 @@ fn parse_gfa(gfa_path: &str) -> std::io::Result<(Vec<usize>, usize)> {
     let mut max_id = 0;
 
     loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
+        buf.clear();
+        let bytes_read = reader.read_until(b'\n', &mut buf)?;
         if bytes_read == 0 {
             break;
         }
 
-        let line_str = line.trim();
+        let line_b = trim_eol(&buf);
 
         // Only process segment lines
-        if !line_str.starts_with('S') {
+        if line_b.first() != Some(&b'S') {
             continue;
         }
 
         // Parse segment line format: S<tab>id<tab>sequence
-        let mut fields = line_str.split('\t');
-        let Some((id_str, seq)) = fields.next().and_then(|_type| {
-            let id_str = fields.next()?;
+        let mut fields = line_b.split(|&c| c == b'\t');
+        let Some((id_b, seq)) = fields.next().and_then(|_type| {
+            let id_b = fields.next()?;
             let seq = fields.next()?;
-            Some((id_str, seq))
+            Some((id_b, seq))
         }) else {
             continue;
         };
 
         // Parse segment ID
-        let id = id_str.parse::<usize>().unwrap();
+        let id = parse_usize_bytes(id_b).expect("non-numeric GFA segment id");
         min_id = min_id.min(id);
         max_id = max_id.max(id);
         segments.push((id, seq.len()));
@@ -1135,7 +1167,7 @@ fn process_bucket(
 /// empty vec for unparseable or unmapped paths, matching walk_gfa's behaviour
 /// of warning and continuing.
 fn buckets_for_pline(
-    line_str: &str,
+    line_b: &[u8],
     path_to_seq_id_map: &HashMap<String, usize>,
     path_starts: &[usize],
     records: &[Record],
@@ -1143,7 +1175,15 @@ fn buckets_for_pline(
     min_id: usize,
     dedup: bool,
 ) -> Vec<BucketOut> {
-    let line_str = line_str.trim();
+    // Validation happens here, on a worker thread, rather than in the serial
+    // read loop: read_line would UTF-8-validate all 26.4 GB single-threaded.
+    let line_str = match std::str::from_utf8(line_b) {
+        Ok(v) => v.trim(),
+        Err(e) => {
+            eprintln!("Skipping non-UTF-8 GFA path line: {}\n", e);
+            return Vec::new();
+        }
+    };
     let mut fields = line_str.split('\t');
     let Some((name, steps_str)) = fields.next().and_then(|_type| {
         let name = fields.next()?;
@@ -1295,8 +1335,11 @@ fn walk_gfa_parallel(
 
     let path = Path::new(gfa_path);
     let mut reader = create_reader(path)?;
-    let mut line = String::new();
-    let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+    // Raw bytes, not read_line-into-String: the walk phase rescans the whole
+    // GFA (28.08M lines / 26.4 GB on chr1) and only 4,817 of those lines are
+    // P-lines. read_line would UTF-8-validate every byte on the serial path.
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
     // Serial-phase accounting: merge_secs is the ordered-merge cost (the price
     // of determinism); read_secs is the single-threaded GFA line scan.
     // Serial-phase accounting. Measured by subtraction rather than per-line
@@ -1311,19 +1354,21 @@ fn walk_gfa_parallel(
     let mut p_lines: u64 = 0;
 
     loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
+        buf.clear();
+        let bytes_read = reader.read_until(b'\n', &mut buf)?;
         let eof = bytes_read == 0;
         if !eof {
             lines_scanned += 1;
-            if !line.trim_start().starts_with('P') {
+            // GFA record type is the first byte of the line; no leading
+            // whitespace is permitted by the spec.
+            if buf.first() != Some(&b'P') {
                 continue;
             }
-            // NOT mem::take: that hands `line`'s buffer to the batch and
-            // leaves `line` empty, so every subsequent P-line regrows from
+            // NOT mem::take: that would hand `buf`'s allocation to the batch
+            // and leave `buf` empty, so every subsequent P-line regrows from
             // zero capacity. Cloning is one exact-size alloc plus one copy,
-            // and `line` retains its capacity for the next read.
-            batch.push(line.clone());
+            // and `buf` retains its capacity for the next read.
+            batch.push(buf.clone());
             p_lines += 1;
         }
         if batch.len() >= batch_size || (eof && !batch.is_empty()) {
