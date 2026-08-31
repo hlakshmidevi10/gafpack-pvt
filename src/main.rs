@@ -116,15 +116,20 @@ fn for_each_step(
 fn create_reader(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
     let file = File::open(path)?;
 
+    // 4 MiB rather than BufReader's 8 KiB default. The GFA is scanned end to
+    // end twice (S-lines in parse_gfa, P-lines in the walker) and reaches
+    // 26.4 GB on HPRCv2.1 MC chr1 -- at 8 KiB that is ~3.3M read syscalls per
+    // pass. Sequential scan, so a large buffer costs nothing but the pages.
+    const GFA_BUF: usize = 4 << 20;
     if path
         .extension()
         .is_some_and(|ext| ext == "gz" || ext == "bgz")
     {
         let decoder = GzDecoder::new(file);
-        let buf_reader = BufReader::new(decoder);
+        let buf_reader = BufReader::with_capacity(GFA_BUF, decoder);
         Ok(Box::new(buf_reader))
     } else {
-        let buf_reader = BufReader::new(file);
+        let buf_reader = BufReader::with_capacity(GFA_BUF, file);
         Ok(Box::new(buf_reader))
     }
 }
@@ -1306,7 +1311,12 @@ fn walk_gfa_parallel(
             if !line.trim_start().starts_with('P') {
                 continue;
             }
-            batch.push(std::mem::take(&mut line));
+            // NOT mem::take: that hands `line`'s buffer to the batch and
+            // leaves `line` empty, so every subsequent P-line regrows from
+            // zero capacity (P-lines average 5.5 MB on HPRC chr1 -- a full
+            // doubling-realloc chain each). Cloning is one exact-size alloc
+            // plus one copy, and `line` retains its capacity for the next read.
+            batch.push(line.clone());
         }
         read_secs += read_start.elapsed().as_secs_f64();
         if batch.len() >= batch_size || (eof && !batch.is_empty()) {
