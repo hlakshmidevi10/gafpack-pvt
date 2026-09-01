@@ -1069,10 +1069,58 @@ fn traverse_collect(
     total_path_length
 }
 
+
+/// Build (node_ids, cum_bp) for a path in FORWARD order by parsing its steps.
+/// This is the hot loop of the whole program: one integer parse plus one random
+/// probe into segment_lengths per step, and step-visits reaches 5.97e9 on
+/// HPRCv2.1 MC chr1. It must run once per path, never once per bucket.
+#[inline]
+fn build_forward_arrays(
+    steps: &[&str],
+    segment_lengths: &[usize],
+    min_id: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let n = steps.len();
+    let mut node_ids: Vec<usize> = Vec::with_capacity(n);
+    let mut cum: Vec<usize> = Vec::with_capacity(n + 1);
+    cum.push(0);
+    for step in steps.iter() {
+        let (seg, _orient) = step.split_at(step.len() - 1);
+        let seg_id = seg.parse::<usize>().unwrap();
+        node_ids.push(seg_id);
+        cum.push(cum.last().unwrap() + segment_lengths[seg_id - min_id]);
+    }
+    (node_ids, cum)
+}
+
+/// Derive the REVERSE bucket's arrays from the forward ones, with no parsing
+/// and no segment_lengths probes.
+///
+/// The reverse traversal visits nodes n-1, n-2, ... 0, so:
+///     node_ids_rev[i] = node_ids_fwd[n-1-i]
+///     cum_bp_rev[i]   = total - cum_bp_fwd[n-i]
+/// Endpoints check out: cum_rev[0] = total - cum_fwd[n] = 0, and
+/// cum_rev[n] = total - cum_fwd[0] = total. A node's length does not depend on
+/// which direction it is traversed, which is what makes this exact rather than
+/// approximate. Verified against a literal re-parse of the reversed step slice
+/// in tests::reverse_arrays_match_reparse.
+#[inline]
+fn derive_reverse_arrays(
+    node_ids_fwd: &[usize],
+    cum_fwd: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let n = node_ids_fwd.len();
+    let total = cum_fwd[n];
+    let node_ids_rev: Vec<usize> = node_ids_fwd.iter().rev().copied().collect();
+    let cum_rev: Vec<usize> = (0..=n).map(|i| total - cum_fwd[n - i]).collect();
+    (node_ids_rev, cum_rev)
+}
+
 /// Pure per-bucket worker. No shared state, no I/O, no stderr.
 #[allow(clippy::too_many_arguments)]
 fn process_bucket(
-    steps: &[&str],
+    step_node_ids: &[usize],
+    cum_bp: &[usize],
     seq_id: usize,
     name: &str,
     path_starts: &[usize],
@@ -1081,6 +1129,8 @@ fn process_bucket(
     min_id: usize,
     dedup: bool,
 ) -> BucketOut {
+    debug_assert_eq!(cum_bp.len(), step_node_ids.len() + 1,
+                     "cum_bp must have one more entry than step_node_ids");
     let st = path_starts[seq_id];
     let end = path_starts[seq_id + 1];
     let num_matches = end - st;
@@ -1093,22 +1143,14 @@ fn process_bucket(
         oob: 0,
         oob_msgs: Vec::new(),
         num_matches,
-        n_steps: steps.len(),
+        n_steps: step_node_ids.len(),
     };
     if num_matches == 0 {
         return out;
     }
 
-    // The expensive part: one linear pass over every step of the path.
-    let mut step_node_ids: Vec<usize> = Vec::with_capacity(steps.len());
-    let mut cum_bp: Vec<usize> = Vec::with_capacity(steps.len() + 1);
-    cum_bp.push(0);
-    for step in steps.iter() {
-        let (seg, _orient) = step.split_at(step.len() - 1);
-        let seg_id = seg.parse::<usize>().unwrap();
-        step_node_ids.push(seg_id);
-        cum_bp.push(cum_bp.last().unwrap() + segment_lengths[seg_id - min_id]);
-    }
+    // Arrays are built once per PATH by the caller and shared between this
+    // path's forward and reverse buckets -- see buckets_for_pline().
     let path_total_bp = *cum_bp.last().unwrap();
 
     out.recs.reserve(num_matches);
@@ -1130,7 +1172,7 @@ fn process_bucket(
             continue;
         }
 
-        advance_step_cursor(path_bp, &cum_bp, &mut i, &mut cum);
+        advance_step_cursor(path_bp, cum_bp, &mut i, &mut cum);
         debug_assert!(cum_bp[i] <= path_bp);
         debug_assert!(path_bp < cum_bp[i + 1]);
         let curr_offset = path_bp - cum;
@@ -1198,15 +1240,57 @@ fn buckets_for_pline(
         return Vec::new();
     };
 
-    let positive_strand_seq_id = path_idx * 2;
-    let steps: Vec<&str> = steps_str.split(',').collect();
-    let fwd = process_bucket(&steps, positive_strand_seq_id, name,
-                             path_starts, records, segment_lengths, min_id, dedup);
-    let reverse_steps: Vec<&str> = steps.iter().rev().copied().collect();
+    let seq_id = path_idx * 2;
     let rev_name = format!("{}_reverse", name);
-    let rev = process_bucket(&reverse_steps, positive_strand_seq_id + 1, &rev_name,
+
+    // Both buckets empty: skip the parse entirely. process_bucket used to
+    // return before building its arrays in this case, so parsing here
+    // unconditionally would ADD work on record-free paths (1,541 of the 9,634
+    // buckets on mc-chr1). n_steps is only read by the merge when
+    // num_matches > 0, so leaving it 0 here is sound.
+    if path_starts[seq_id + 1] == path_starts[seq_id]
+        && path_starts[seq_id + 2] == path_starts[seq_id + 1]
+    {
+        return vec![
+            empty_bucket(name, seq_id),
+            empty_bucket(&rev_name, seq_id + 1),
+        ];
+    }
+
+    let steps: Vec<&str> = steps_str.split(',').collect();
+
+    // Parse ONCE per path. The reverse bucket's arrays are pure arithmetic on
+    // these, so the expensive per-step work (integer parse + a random probe
+    // into a segment_lengths array larger than L3) is not repeated. `steps`
+    // is dead after this: traverse_collect walks node_ids only, because the
+    // parallel path never builds a GAF path_str.
+    let (node_ids_fwd, cum_fwd) = build_forward_arrays(&steps, segment_lengths, min_id);
+    drop(steps);
+
+    let fwd = process_bucket(&node_ids_fwd, &cum_fwd, seq_id, name,
+                             path_starts, records, segment_lengths, min_id, dedup);
+
+    let (node_ids_rev, cum_rev) = derive_reverse_arrays(&node_ids_fwd, &cum_fwd);
+    drop(node_ids_fwd);
+    drop(cum_fwd);
+
+    let rev = process_bucket(&node_ids_rev, &cum_rev, seq_id + 1, &rev_name,
                              path_starts, records, segment_lengths, min_id, dedup);
     vec![fwd, rev]
+}
+
+/// A bucket with no records: nothing for the merge to apply.
+fn empty_bucket(name: &str, seq_id: usize) -> BucketOut {
+    BucketOut {
+        name: name.to_string(),
+        seq_id,
+        recs: Vec::new(),
+        contribs: Vec::new(),
+        oob: 0,
+        oob_msgs: Vec::new(),
+        num_matches: 0,
+        n_steps: 0,
+    }
 }
 
 /// Running state for the sequential merge.
@@ -1792,6 +1876,85 @@ mod tests {
     // path_bp - cum_bp[i] is the offset. This is the exact derivation
     // process_path_matches does.
     // -------------------------------------------------------------------------
+
+
+    // ---- reverse-array derivation -----------------------------------------
+    // derive_reverse_arrays() replaces re-parsing a reversed step slice. The
+    // reference below IS the old code path (reverse the slice, then parse), so
+    // these assert exact equivalence rather than merely plausible behaviour.
+
+    fn reference_reverse(steps: &[&str], lens: &[usize], min_id: usize)
+        -> (Vec<usize>, Vec<usize>)
+    {
+        let rev: Vec<&str> = steps.iter().rev().copied().collect();
+        build_forward_arrays(&rev, lens, min_id)
+    }
+
+    fn check_reverse(steps: &[&str], lens: &[usize], min_id: usize) {
+        let (ids_f, cum_f) = build_forward_arrays(steps, lens, min_id);
+        let (ids_d, cum_d) = derive_reverse_arrays(&ids_f, &cum_f);
+        let (ids_r, cum_r) = reference_reverse(steps, lens, min_id);
+        assert_eq!(ids_d, ids_r, "node_ids mismatch for {:?}", steps);
+        assert_eq!(cum_d, cum_r, "cum_bp mismatch for {:?}", steps);
+        // Structural invariants the walker relies on.
+        assert_eq!(cum_d.len(), ids_d.len() + 1);
+        assert_eq!(cum_d[0], 0);
+        assert_eq!(*cum_d.last().unwrap(), *cum_f.last().unwrap());
+        assert!(cum_d.windows(2).all(|w| w[0] <= w[1]), "cum_bp must be non-decreasing");
+    }
+
+    #[test]
+    fn reverse_arrays_match_reparse() {
+        // ids 5..=9, lengths indexed by (id - min_id)
+        let lens = vec![3, 1, 7, 2, 5];
+        check_reverse(&["5+", "7-", "9+", "6+", "8-"], &lens, 5);
+    }
+
+    #[test]
+    fn reverse_arrays_single_step() {
+        let lens = vec![11];
+        check_reverse(&["0+"], &lens, 0);
+        check_reverse(&["0-"], &lens, 0);
+    }
+
+    #[test]
+    fn reverse_arrays_uniform_unit_lengths() {
+        let lens = vec![1; 6];
+        check_reverse(&["0+", "1+", "2+", "3+", "4+", "5+"], &lens, 0);
+    }
+
+    #[test]
+    fn reverse_arrays_sparse_min_id() {
+        // cactus-mc style: ids far from zero (observed min_id ~163M).
+        let min_id = 162_720_608usize;
+        let lens = vec![4, 9, 2, 6];
+        let steps = ["162720609+", "162720611-", "162720608+", "162720610+"];
+        check_reverse(&steps, &lens, min_id);
+    }
+
+    #[test]
+    fn reverse_arrays_repeated_nodes() {
+        // Same node visited several times, both orientations.
+        let lens = vec![5, 8];
+        check_reverse(&["0+", "1-", "0-", "0+", "1+"], &lens, 0);
+    }
+
+    #[test]
+    fn reverse_arrays_randomized() {
+        // Deterministic LCG; no dev-dependency needed.
+        let mut state: u64 = 0x2026_08_31;
+        let mut next = move || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as usize };
+        for _trial in 0..500 {
+            let n_nodes = 1 + next() % 12;
+            let lens: Vec<usize> = (0..n_nodes).map(|_| 1 + next() % 1024).collect();
+            let n_steps = 1 + next() % 40;
+            let owned: Vec<String> = (0..n_steps)
+                .map(|_| format!("{}{}", next() % n_nodes, if next() % 2 == 0 { "+" } else { "-" }))
+                .collect();
+            let steps: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+            check_reverse(&steps, &lens, 0);
+        }
+    }
 
     fn fixture_cum_bp() -> Vec<usize> {
         vec![0, 5, 12, 13, 16]
